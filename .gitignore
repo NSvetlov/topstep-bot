@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+.venv/
+
+# Environment files
+.env
+
+# Local API key files
+topstep_api_key.txt
+.topstep_api_key
+TOPSTEP_API_KEY.txt
+
+# Generated trade logs/CSVs
+mnq_trades*.csv
+
+# Misc
+.DS_Store
+*.ipynb_checkpoints/
