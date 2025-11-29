@@ -55,15 +55,15 @@ STOP_BUFFER_POINTS = 0.75
 
 # Risk
 MULTIPLIER = 2.0           # MNQ $2 per index point per contract
-MAX_CONTRACTS = 20         # cap MNQ size for safer trend-following
-MIN_QTY = 5                # minimum contracts per entry (risk-based floor)
+MAX_CONTRACTS = 10         # cap MNQ size for safer trend-following
+MIN_QTY = 2                # minimum contracts per entry (risk-based floor)
 RISK_PER_TRADE = 80.0      # target dollar risk per trade
 MAX_TRADE_RISK = 500.0     # legacy
 DAILY_LOSS_LIMIT = -250.0  # hard daily loss cap
  
 # Optional: force a fixed contract quantity per trade (overrides risk-based sizing)
 # Set to an integer (e.g., 2, 4) to enable; leave as None to use risk-based sizing (with MIN_QTY floor)
-FIXED_QTY: Optional[int] = None
+FIXED_QTY: Optional[int] = None  # Ignored for live/backtest sizing; always use risk-based qty
 
 # Time filters (Central Time)
 # Trading sessions: allow NY, London, Asia; block 3:00–5:00 PM Central
@@ -80,7 +80,17 @@ NO_TRADE_END_MIN = 0
 REOPEN_SKIP_MINUTES = 5  # skip first minutes after 5pm CT reopen
 
 # Time stop (bars)
-MAX_HOLD_BARS = 240  # allow longer holds on 1m (~4 hours)
+# Live-aligned exit settings for backtest
+# These mirror defaults in live_trade_topstep.py
+ATR_STOP_MULT = 2.0
+BE_TRIGGER_ATR = 1.0
+BE_OFFSET_ATR = 0.25
+TRAIL1_TRIGGER_ATR = 2.0
+TRAIL1_MULT = 1.5
+TRAIL2_TRIGGER_ATR = 3.0
+TRAIL2_MULT = 1.0
+TIME_STOP_MIN = 120  # minutes
+EXHAUSTION_ATR_MULT = 4.0  # overshoot threshold vs hourly EMA (backtest-only)
 
 STARTING_CAPITAL = 100_000.0
 
@@ -369,6 +379,8 @@ def backtest(df: pd.DataFrame):
     entry_index: Optional[int] = None
     atr_at_entry: Optional[float] = None
     stop_points_entry: Optional[float] = None
+    entry_time: Optional[pd.Timestamp] = None
+    mfe_price: Optional[float] = None  # best favorable price since entry (high for long, low for short)
 
     realized_pnl = 0.0
     daily_pnl = 0.0
@@ -437,24 +449,43 @@ def backtest(df: pd.DataFrame):
             exit_reason = ""
             exit_price = close  # default if time/regime/other exit
 
-            # 0) Breakeven after sufficient favorable excursion and bars in trade
-            unreal = (high - entry_price) if direction == "LONG" else (entry_price - low)
-            if (i - entry_index) >= MIN_BARS_BE:
-                if direction == "LONG" and unreal >= BREAKEVEN_TRIGGER_POINTS:
-                    stop_price = max(stop_price, entry_price)
-                elif direction == "SHORT" and unreal >= BREAKEVEN_TRIGGER_POINTS:
-                    stop_price = min(stop_price, entry_price)
+            # Update MFE (favorable excursion) since entry
+            if mfe_price is None:
+                mfe_price = entry_price
+            if direction == "LONG":
+                mfe_price = max(mfe_price, high)
+            else:
+                mfe_price = min(mfe_price, low)
 
-            # Early abort if trade stalls and trend deteriorates (optional)
-            if not exited:
-                unreal_small = (close - entry_price) if direction == "LONG" else (entry_price - close)
-                ema20_1 = row.get("ema20_1", np.nan)
-                ema50_1 = row.get("ema50_1", np.nan)
-                trend_ok_now = (close > ema20_1 > ema50_1) if direction == "LONG" else (close < ema20_1 < ema50_1)
-                if unreal_small < 5.0 and (not trend_ok_now):
-                    exit_price = close
-                    exit_reason = "EARLY_ABORT"
-                    exited = True
+            # 0) Breakeven and trailing using entry ATR (live-aligned)
+            if not exited and atr_at_entry is not None and atr_at_entry > 0:
+                move_fav = (close - entry_price) if direction == "LONG" else (entry_price - close)
+                # Initial stop from entry ATR (kept from entry)
+                if direction == "LONG":
+                    base_stop = entry_price - ATR_STOP_MULT * atr_at_entry
+                    stop_price = max(stop_price, base_stop)
+                else:
+                    base_stop = entry_price + ATR_STOP_MULT * atr_at_entry
+                    stop_price = min(stop_price, base_stop)
+
+                # Breakeven once price moves in favor by BE_TRIGGER_ATR
+                if move_fav >= BE_TRIGGER_ATR * atr_at_entry:
+                    if direction == "LONG":
+                        stop_price = max(stop_price, entry_price + BE_OFFSET_ATR * atr_at_entry)
+                    else:
+                        stop_price = min(stop_price, entry_price - BE_OFFSET_ATR * atr_at_entry)
+
+                # Tiered ATR trailing using MFE
+                if move_fav >= TRAIL1_TRIGGER_ATR * atr_at_entry:
+                    if direction == "LONG":
+                        stop_price = max(stop_price, mfe_price - TRAIL1_MULT * atr_at_entry)
+                    else:
+                        stop_price = min(stop_price, mfe_price + TRAIL1_MULT * atr_at_entry)
+                if move_fav >= TRAIL2_TRIGGER_ATR * atr_at_entry:
+                    if direction == "LONG":
+                        stop_price = max(stop_price, mfe_price - TRAIL2_MULT * atr_at_entry)
+                    else:
+                        stop_price = min(stop_price, mfe_price + TRAIL2_MULT * atr_at_entry)
 
             # 1) Hard stop
             if not exited:
@@ -469,28 +500,31 @@ def backtest(df: pd.DataFrame):
                         exit_reason = "STOP"
                         exited = True
 
-            # 2) ATR trailing stop (trend-following core)
-            if not exited:
-                atr_now = row.get("atr", np.nan)
-                if atr_now is not None and not np.isnan(atr_now) and atr_now > 0:
-                    trail_dist = 3.0 * atr_now  # 3x ATR trailing
-                    if direction == "LONG":
-                        new_stop = close - trail_dist
-                        stop_price = max(stop_price, new_stop)
-                    else:
-                        new_stop = close + trail_dist
-                        stop_price = min(stop_price, new_stop)
+            # 2) Stop breach at bar extremes (intra-bar check)
+            if not exited and stop_price is not None:
+                if direction == "LONG" and low <= stop_price:
+                    exit_price = stop_price
+                    exit_reason = "STOP"
+                    exited = True
+                elif direction == "SHORT" and high >= stop_price:
+                    exit_price = stop_price
+                    exit_reason = "STOP"
+                    exited = True
 
             # 3) Exhaustion exit: price too far from hourly EMA (overshoot)
             if not exited:
                 ema_1h = row.get("ema_1h_50", np.nan)
                 atr_now = row.get("atr", np.nan)
-                if ema_1h is not None and not np.isnan(ema_1h) and atr_now is not None and not np.isnan(atr_now):
-                    if direction == "LONG" and close > ema_1h + 2.0 * atr_now:
+                if (
+                    ema_1h is not None and not np.isnan(ema_1h)
+                    and atr_now is not None and not np.isnan(atr_now)
+                    and atr_now > 0
+                ):
+                    if direction == "LONG" and close > ema_1h + EXHAUSTION_ATR_MULT * atr_now:
                         exit_reason = "EXHAUSTION"
                         exit_price = close
                         exited = True
-                    elif direction == "SHORT" and close < ema_1h - 2.0 * atr_now:
+                    elif direction == "SHORT" and close < ema_1h - EXHAUSTION_ATR_MULT * atr_now:
                         exit_reason = "EXHAUSTION"
                         exit_price = close
                         exited = True
@@ -501,20 +535,13 @@ def backtest(df: pd.DataFrame):
                 exit_price = close
                 exited = True
 
-            # 5) regime flip or time-stop
-            if not exited:
-                bars_held = i - entry_index
-                if (direction == "LONG" and regime == "DOWN") or (
-                    direction == "SHORT" and regime == "UP"
-                ):
-                    exit_reason = "REGIME_FLIP"
+            # 5) time-stop (live-aligned); no regime-flip exit
+            if not exited and entry_time is not None:
+                minutes_in_trade = (ts - entry_time).total_seconds() / 60.0
+                if minutes_in_trade >= TIME_STOP_MIN:
+                    exit_reason = "TIME_STOP"
                     exit_price = close
                     exited = True
-                else:
-                    if bars_held >= MAX_HOLD_BARS:
-                        exit_reason = "TIME_STOP"
-                        exit_price = close
-                        exited = True
 
             if exited:
                 if direction == "LONG":
@@ -543,6 +570,8 @@ def backtest(df: pd.DataFrame):
                 entry_price = stop_price = target_price = None
                 entry_index = None
                 atr_at_entry = None
+                entry_time = None
+                mfe_price = None
                 stop_points_entry = None
 
                 # record cooldown for same-direction re-entry after stop
@@ -689,23 +718,20 @@ def backtest(df: pd.DataFrame):
                 if direction == "SHORT" and (i - last_stop_i_short) < COOLDOWN_BARS:
                     continue
 
-                # Position sizing
-                if FIXED_QTY is not None and FIXED_QTY > 0:
-                    qty = min(FIXED_QTY, MAX_CONTRACTS)
-                else:
-                    # ATR-based stop distance: 2x ATR
-                    stop_points = 2.0 * atr
-                    if stop_points <= 0:
-                        continue
+                # Position sizing (risk-based only)
+                # ATR-based stop distance: 2x ATR
+                stop_points = 2.0 * atr
+                if stop_points <= 0:
+                    continue
 
-                    risk_per_contract = stop_points * MULTIPLIER
-                    if risk_per_contract <= 0:
-                        continue
+                risk_per_contract = stop_points * MULTIPLIER
+                if risk_per_contract <= 0:
+                    continue
 
-                    qty = int(RISK_PER_TRADE / risk_per_contract)
-                    # Enforce minimum size even if risk-based qty is small
-                    qty = max(qty, MIN_QTY)
-                    qty = min(qty, MAX_CONTRACTS)
+                qty = int(RISK_PER_TRADE / risk_per_contract)
+                # Enforce minimum size even if risk-based qty is small
+                qty = max(qty, MIN_QTY)
+                qty = min(qty, MAX_CONTRACTS)
 
                 if direction == "LONG":
                     stop_raw = close - stop_points
@@ -720,8 +746,10 @@ def backtest(df: pd.DataFrame):
                 stop_price = stop_raw
                 target_price = target_raw
                 entry_index = i
+                entry_time = ts
                 atr_at_entry = atr
                 stop_points_entry = stop_points
+                mfe_price = entry_price
                 total_positions += 1
                 realized_at_entry = realized_pnl
                 pos_reached18 = False

@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 from datetime import datetime
 
 import numpy as np
@@ -10,14 +10,14 @@ from mnq_backtest import (
     load_mnq_data,
     classify_regime,
     in_entry_session,
+    past_force_flat,
     # sizing params
-    FIXED_QTY,
     MIN_QTY,
     MAX_CONTRACTS,
     MULTIPLIER,
     RISK_PER_TRADE,
 )
-from pnl_widget import PnLWidget
+# PnL widget is optional; import lazily only when enabled
 
 
 def compute_entry_signal(row) -> Optional[str]:
@@ -37,10 +37,10 @@ def compute_entry_signal(row) -> Optional[str]:
 
 
 def compute_qty(row) -> Optional[int]:
+    """Risk-based sizing only: qty from 2x ATR stop and RISK_PER_TRADE.
+    Clamped to [MIN_QTY, MAX_CONTRACTS].
+    """
     atr = row.get("atr", np.nan)
-    if FIXED_QTY is not None and FIXED_QTY > 0:
-        return min(int(FIXED_QTY), int(MAX_CONTRACTS))
-
     if atr is None or np.isnan(atr) or atr <= 0:
         return None
     stop_points = 2.0 * atr
@@ -110,10 +110,42 @@ def main():
     def point_value_for(symbol: str) -> float:
         return float(PNT_VALUE.get(symbol.upper(), MULTIPLIER))
 
-    # Track open positions we initiated: contractId -> (side, qty, entry_price)
-    open_positions_local: Dict[str, Tuple[str, int, float]] = {}
+    # Track open positions we initiated: contractId -> record dict
+    # record keys: side("LONG"/"SHORT"), qty(int), entry_price(float), entry_time(datetime), atr(float), mfe_price(float), exit_sent(bool)
+    open_positions_local: Dict[str, Dict[str, Any]] = {}
 
-    # PnL accounting and UI widget
+    # Exit management settings (env overrides)
+    def _env_float(name: str, default: float) -> float:
+        try:
+            v = float(os.environ.get(name, str(default)).strip())
+            return v
+        except Exception:
+            return default
+
+    def _env_int(name: str, default: int) -> int:
+        try:
+            v = int(float(os.environ.get(name, str(default)).strip()))
+            return v
+        except Exception:
+            return default
+
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+
+    ATR_STOP_MULT = _env_float("TOPSTEP_ATR_STOP_MULT", 2.0)
+    BE_TRIGGER_ATR = _env_float("TOPSTEP_BE_TRIGGER_ATR", 1.0)
+    BE_OFFSET_ATR = _env_float("TOPSTEP_BE_OFFSET_ATR", 0.25)
+    TRAIL1_TRIGGER_ATR = _env_float("TOPSTEP_TRAIL1_TRIGGER_ATR", 2.0)
+    TRAIL1_MULT = _env_float("TOPSTEP_TRAIL1_MULT", 1.5)
+    TRAIL2_TRIGGER_ATR = _env_float("TOPSTEP_TRAIL2_TRIGGER_ATR", 3.0)
+    TRAIL2_MULT = _env_float("TOPSTEP_TRAIL2_MULT", 1.0)
+    TIME_STOP_MIN = _env_int("TOPSTEP_TIME_STOP_MIN", 120)
+    ENFORCE_FORCE_FLAT = _env_bool("TOPSTEP_FORCE_FLAT", True)
+
+    # PnL accounting and optional UI widget
     realized_pnl: float = 0.0
     peak_equity: float = 0.0
     max_dd: float = 0.0
@@ -121,10 +153,20 @@ def main():
     losses = 0
     acct_label = os.environ.get("TOPSTEP_ACCOUNT_LABEL") or os.environ.get("TOPSTEP_ACCOUNT_ID") or ""
     title = f"Topstep PnL{(' - ' + acct_label) if acct_label else ''}"
-    widget = PnLWidget(title=title)
+    # Control widget via env flag (default: disabled)
+    show_widget_env = os.environ.get("TOPSTEP_SHOW_WIDGET", "false").strip().lower()
+    show_widget = show_widget_env in ("1", "true", "yes")
+    widget = None
+    if show_widget:
+        try:
+            from pnl_widget import PnLWidget  # lazy import to avoid matplotlib if disabled
+            widget = PnLWidget(title=title)
+        except Exception as _e:
+            # If widget fails to init, continue without UI
+            widget = None
 
-    # Brackets default enabled with 10/20 ticks; env overrides allowed
-    use_bracket_env = os.environ.get("TOPSTEP_USE_BRACKET", "true").strip().lower()
+    # Brackets default disabled; env overrides allowed
+    use_bracket_env = os.environ.get("TOPSTEP_USE_BRACKET", "false").strip().lower()
     use_bracket = use_bracket_env in ("1", "true", "yes")
     stop_ticks_env = os.environ.get("TOPSTEP_STOP_TICKS", "10").strip()
     take_ticks_env = os.environ.get("TOPSTEP_TAKE_TICKS", "20").strip()
@@ -223,11 +265,15 @@ def main():
                                 print(f"{ts}: bracket rejected; retried without brackets -> {resp2}")
                                 # Track local position on assumed fill
                                 if contract_id not in open_positions_local:
-                                    open_positions_local[contract_id] = (
-                                        side,
-                                        int(qty),
-                                        float(row["Close"]),
-                                    )
+                                    open_positions_local[contract_id] = {
+                                        "side": side,
+                                        "qty": int(qty),
+                                        "entry_price": float(row["Close"]),
+                                        "entry_time": datetime.now(),
+                                        "atr": float(row.get("atr") or 0.0),
+                                        "mfe_price": float(row["Close"]),
+                                        "exit_sent": False,
+                                    }
                             except Exception as e2:
                                 print(f"{ts}: retry without brackets failed: {e2}")
                         else:
@@ -236,11 +282,15 @@ def main():
                         print(f"{ts}: submitted {side} {qty} {base} (acct {account_id}, contract {contract_id}) -> {resp}")
                         # Track local position on assumed fill
                         if contract_id not in open_positions_local:
-                            open_positions_local[contract_id] = (
-                                side,
-                                int(qty),
-                                float(row["Close"]),
-                            )
+                            open_positions_local[contract_id] = {
+                                "side": side,
+                                "qty": int(qty),
+                                "entry_price": float(row["Close"]),
+                                "entry_time": datetime.now(),
+                                "atr": float(row.get("atr") or 0.0),
+                                "mfe_price": float(row["Close"]),
+                                "exit_sent": False,
+                            }
                 except Exception as e:
                     print(f"{ts}: order submit failed for {base}: {e}")
 
@@ -270,10 +320,10 @@ def main():
             except Exception:
                 pass
 
-            # Compute unrealized PnL across all locally tracked positions
+            # Compute exits and unrealized PnL across all locally tracked positions
             unrealized_total = 0.0
             to_remove: List[str] = []
-            for cid, (p_side, p_qty, p_entry) in list(open_positions_local.items()):
+            for cid, rec in list(open_positions_local.items()):
                 base = contract_to_symbol.get(cid)
                 if not base:
                     continue
@@ -289,10 +339,84 @@ def main():
                         df_latest = load_mnq_data(ticker=tkr)
                         if df_latest.empty:
                             continue
-                        last_close = float(df_latest.iloc[-1]["Close"]) 
+                        last_close = float(df_latest.iloc[-1]["Close"])
                     except Exception:
                         continue
 
+                p_side: str = str(rec.get("side"))
+                p_qty: int = int(rec.get("qty", 0))
+                p_entry: float = float(rec.get("entry_price", last_close))
+                p_time: datetime = rec.get("entry_time") or datetime.now()
+                atr_entry: float = float(rec.get("atr") or 0.0)
+                mfe_price: float = float(rec.get("mfe_price") or p_entry)
+                exit_sent: bool = bool(rec.get("exit_sent", False))
+
+                # Update MFE price
+                if p_side == "LONG":
+                    mfe_price = max(mfe_price, last_close)
+                else:
+                    mfe_price = min(mfe_price, last_close)
+                rec["mfe_price"] = mfe_price
+
+                # Exit rules (only if position is live and we haven't already sent an exit)
+                qty_live = int(active_contracts.get(cid, 0))
+                should_exit = False
+                if qty_live > 0 and not exit_sent:
+                    # Time stop
+                    minutes_in_trade = (now_dt - p_time).total_seconds() / 60.0
+                    if TIME_STOP_MIN > 0 and minutes_in_trade >= TIME_STOP_MIN:
+                        should_exit = True
+
+                    # Force flat window
+                    if not should_exit and ENFORCE_FORCE_FLAT and past_force_flat(now_dt):
+                        should_exit = True
+
+                    # Price-based stops using entry ATR
+                    if not should_exit and atr_entry > 0:
+                        # initial stop
+                        if p_side == "LONG":
+                            stop_price = p_entry - ATR_STOP_MULT * atr_entry
+                            move_fav = last_close - p_entry
+                            # breakeven
+                            if move_fav >= BE_TRIGGER_ATR * atr_entry:
+                                stop_price = max(stop_price, p_entry + BE_OFFSET_ATR * atr_entry)
+                            # trails
+                            if move_fav >= TRAIL1_TRIGGER_ATR * atr_entry:
+                                stop_price = max(stop_price, mfe_price - TRAIL1_MULT * atr_entry)
+                            if move_fav >= TRAIL2_TRIGGER_ATR * atr_entry:
+                                stop_price = max(stop_price, mfe_price - TRAIL2_MULT * atr_entry)
+                            if last_close <= stop_price:
+                                should_exit = True
+                        else:  # SHORT
+                            stop_price = p_entry + ATR_STOP_MULT * atr_entry
+                            move_fav = p_entry - last_close
+                            if move_fav >= BE_TRIGGER_ATR * atr_entry:
+                                stop_price = min(stop_price, p_entry - BE_OFFSET_ATR * atr_entry)
+                            if move_fav >= TRAIL1_TRIGGER_ATR * atr_entry:
+                                stop_price = min(stop_price, mfe_price + TRAIL1_MULT * atr_entry)
+                            if move_fav >= TRAIL2_TRIGGER_ATR * atr_entry:
+                                stop_price = min(stop_price, mfe_price + TRAIL2_MULT * atr_entry)
+                            if last_close >= stop_price:
+                                should_exit = True
+
+                # Send exit order if needed
+                if qty_live > 0 and should_exit and not exit_sent:
+                    try:
+                        exit_side = "SELL" if p_side == "LONG" else "BUY"
+                        resp_exit = client.place_market_order(
+                            account_id=account_id,
+                            contract_id=cid,
+                            side=exit_side,
+                            size=int(qty_live),
+                            stop_ticks=None,
+                            take_ticks=None,
+                        )
+                        rec["exit_sent"] = True
+                        print(f"{now_dt}: exit sent {exit_side} {qty_live} {base} (contract {cid}) -> {resp_exit}")
+                    except Exception as e:
+                        print(f"{now_dt}: exit order failed for {base}: {e}")
+
+                # PnL calc (unrealized)
                 pv = point_value_for(base)
                 if p_side == "LONG":
                     unreal = (last_close - p_entry) * p_qty * pv
@@ -324,7 +448,9 @@ def main():
                             realized = (p_entry - last_close) * delta * pv
                         realized_pnl += realized
                         # Update stored qty to live qty
-                        open_positions_local[cid] = (p_side, qty_live, p_entry)
+                        rec["qty"] = qty_live
+                        # Allow subsequent exit signals to send another order
+                        rec["exit_sent"] = False
 
             for cid in to_remove:
                 open_positions_local.pop(cid, None)
@@ -336,14 +462,15 @@ def main():
             if dd > max_dd:
                 max_dd = dd
 
-            # Update widget
-            widget.update(
-                ts=now_dt,
-                equity=equity_now,
-                realized=realized_pnl,
-                unrealized=unrealized_total,
-                stats={"wins": wins, "losses": losses, "max_dd": max_dd},
-            )
+            # Update widget (when enabled)
+            if widget is not None:
+                widget.update(
+                    ts=now_dt,
+                    equity=equity_now,
+                    realized=realized_pnl,
+                    unrealized=unrealized_total,
+                    stats={"wins": wins, "losses": losses, "max_dd": max_dd},
+                )
 
             time.sleep(60)
         except KeyboardInterrupt:
