@@ -466,45 +466,7 @@ def main():
                 if (hh > 12 or (hh == 12 and mm >= 0)) and (hh < 14 or (hh == 14 and mm == 0)):
                     z_entry = max(z_entry, 1.2)
 
-                # Volatility filter on ATR at entry (RTH uplift)
-                # Per-ticker ATR/DATR bands with fallback to global min/max
-                try:
-                    atr_min_global = float(os.environ.get("TOPSTEP_ATR_ENTRY_MIN", "6").strip())
-                    atr_max_global = float(os.environ.get("TOPSTEP_ATR_ENTRY_MAX", "20").strip())
-                except Exception:
-                    atr_min_global, atr_max_global = 6.0, 20.0
-                atr_here_chk = float(row.get("atr") or 0.0)
-                pv_here = point_value_for(base)
-                datr_here = atr_here_chk * pv_here
-                # Prefer dollar ATR bands if provided for this symbol
-                band_used = None
-                symu = base.upper()
-                if symu in datr_band_map:
-                    lo, hi = datr_band_map[symu]
-                    band_used = ("DATR", lo, hi)
-                    if not (lo <= datr_here <= hi):
-                        print(f"{ts}: skip {base} due to $ATR filter ({datr_here:.2f} not in [{lo},{hi}]).")
-                        continue
-                elif symu in atr_band_map:
-                    lo, hi = atr_band_map[symu]
-                    band_used = ("ATR", lo, hi)
-                    if not (lo <= atr_here_chk <= hi):
-                        print(f"{ts}: skip {base} due to ATR filter ({atr_here_chk:.2f} not in [{lo},{hi}]).")
-                        continue
-                elif symu in DEFAULT_ATR_BANDS:
-                    lo, hi = DEFAULT_ATR_BANDS[symu]
-                    band_used = ("ATR", lo, hi)
-                    if not (lo <= atr_here_chk <= hi):
-                        print(f"{ts}: skip {base} due to ATR filter ({atr_here_chk:.2f} not in [{lo},{hi}]).")
-                        continue
-                else:
-                    # Fallback to global ATR band with RTH uplift
-                    atr_min_use, atr_max_use = atr_min_global, atr_max_global
-                    if (hh > 8 or (hh == 8 and mm >= 30)) and (hh < 11 or (hh == 11 and mm == 0)):
-                        atr_min_use = max(atr_min_use, 8.0)
-                    if not (atr_min_use <= atr_here_chk <= atr_max_use):
-                        print(f"{ts}: skip {base} due to ATR filter ({atr_here_chk:.2f} not in [{atr_min_use},{atr_max_use}]).")
-                        continue
+                # ATR/$ATR entry gating disabled per request (kept ATR must be > 0 check below)
 
                 side = None
                 if mode == "TREND":
