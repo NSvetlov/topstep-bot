@@ -200,6 +200,10 @@ def main():
         return m
 
     atr_band_map: Dict[str, Tuple[float, float]] = _parse_band_map(os.environ.get("TOPSTEP_ATR_ENTRY_BANDS", ""))
+    # Built-in ATR defaults (points) for specific symbols
+    DEFAULT_ATR_BANDS: Dict[str, Tuple[float, float]] = {
+        "MNQ": (10.0, 20.0),
+    }
     datr_band_map_env: Dict[str, Tuple[float, float]] = _parse_band_map(os.environ.get("TOPSTEP_DATR_ENTRY_BANDS", ""))
     # Lower, sensible default $ATR bands if none provided via env
     # Built-in lower defaults (overridden by TOPSTEP_DATR_ENTRY_BANDS if set)
@@ -474,14 +478,21 @@ def main():
                 datr_here = atr_here_chk * pv_here
                 # Prefer dollar ATR bands if provided for this symbol
                 band_used = None
-                if base.upper() in datr_band_map:
-                    lo, hi = datr_band_map[base.upper()]
+                symu = base.upper()
+                if symu in datr_band_map:
+                    lo, hi = datr_band_map[symu]
                     band_used = ("DATR", lo, hi)
                     if not (lo <= datr_here <= hi):
                         print(f"{ts}: skip {base} due to $ATR filter ({datr_here:.2f} not in [{lo},{hi}]).")
                         continue
-                elif base.upper() in atr_band_map:
-                    lo, hi = atr_band_map[base.upper()]
+                elif symu in atr_band_map:
+                    lo, hi = atr_band_map[symu]
+                    band_used = ("ATR", lo, hi)
+                    if not (lo <= atr_here_chk <= hi):
+                        print(f"{ts}: skip {base} due to ATR filter ({atr_here_chk:.2f} not in [{lo},{hi}]).")
+                        continue
+                elif symu in DEFAULT_ATR_BANDS:
+                    lo, hi = DEFAULT_ATR_BANDS[symu]
                     band_used = ("ATR", lo, hi)
                     if not (lo <= atr_here_chk <= hi):
                         print(f"{ts}: skip {base} due to ATR filter ({atr_here_chk:.2f} not in [{lo},{hi}]).")

@@ -136,6 +136,10 @@ def _parse_band_map(raw: str):
     return m
 
 ATR_BAND_MAP = _parse_band_map(os.environ.get("TOPSTEP_ATR_ENTRY_BANDS", ""))
+# Built-in ATR defaults (points)
+DEFAULT_ATR_BANDS = {
+    "MNQ": (10.0, 20.0),
+}
 # Lower, sensible default $ATR bands if none provided via env
 DEFAULT_DATR_BANDS = {
     "MNQ": (6.0, 30.0),
@@ -1029,6 +1033,10 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                     continue
             elif sym in ATR_BAND_MAP:
                 lo, hi = ATR_BAND_MAP[sym]
+                if not (lo <= atr <= hi):
+                    continue
+            elif sym in DEFAULT_ATR_BANDS:
+                lo, hi = DEFAULT_ATR_BANDS[sym]
                 if not (lo <= atr <= hi):
                     continue
             else:
