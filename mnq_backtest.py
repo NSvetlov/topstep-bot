@@ -151,6 +151,9 @@ _DATR_ENV = _parse_band_map(os.environ.get("TOPSTEP_DATR_ENTRY_BANDS", ""))
 DATR_BAND_MAP = {**DEFAULT_DATR_BANDS, **_DATR_ENV}
 BASE_SYMBOL = (TICKER.split("=")[0] if "=" in TICKER else TICKER).strip().upper()
 
+# Disable ATR/$ATR entry gating for backtest (still requires ATR > 0)
+ATR_FILTER_ENABLED = False
+
 
 @dataclass
 class Trade:
@@ -1019,32 +1022,33 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
 
             if atr is None or np.isnan(atr) or atr <= 0:
                 continue
-            # ATR/$ATR entry bands per symbol with fallback to global and RTH uplift
-            ATR_ENTRY_MIN = 6.0
-            ATR_ENTRY_MAX = 20.0
-            hh = ts.hour
-            mm = ts.minute
-            sym = (base_symbol or BASE_SYMBOL or "MNQ").upper()
-            pv_here = point_value_for(sym)
-            datr = atr * pv_here
-            if sym in DATR_BAND_MAP:
-                lo, hi = DATR_BAND_MAP[sym]
-                if not (lo <= datr <= hi):
-                    continue
-            elif sym in ATR_BAND_MAP:
-                lo, hi = ATR_BAND_MAP[sym]
-                if not (lo <= atr <= hi):
-                    continue
-            elif sym in DEFAULT_ATR_BANDS:
-                lo, hi = DEFAULT_ATR_BANDS[sym]
-                if not (lo <= atr <= hi):
-                    continue
-            else:
-                atr_min_use = ATR_ENTRY_MIN
-                if (hh > 8 or (hh == 8 and mm >= 30)) and (hh < 11 or (hh == 11 and mm == 0)):
-                    atr_min_use = max(atr_min_use, 8.0)
-                if not (atr_min_use <= atr <= ATR_ENTRY_MAX):
-                    continue
+            # ATR/$ATR entry bands disabled for backtest when ATR_FILTER_ENABLED is False
+            if ATR_FILTER_ENABLED:
+                ATR_ENTRY_MIN = 6.0
+                ATR_ENTRY_MAX = 20.0
+                hh = ts.hour
+                mm = ts.minute
+                sym = (base_symbol or BASE_SYMBOL or "MNQ").upper()
+                pv_here = point_value_for(sym)
+                datr = atr * pv_here
+                if sym in DATR_BAND_MAP:
+                    lo, hi = DATR_BAND_MAP[sym]
+                    if not (lo <= datr <= hi):
+                        continue
+                elif sym in ATR_BAND_MAP:
+                    lo, hi = ATR_BAND_MAP[sym]
+                    if not (lo <= atr <= hi):
+                        continue
+                elif sym in DEFAULT_ATR_BANDS:
+                    lo, hi = DEFAULT_ATR_BANDS[sym]
+                    if not (lo <= atr <= hi):
+                        continue
+                else:
+                    atr_min_use = ATR_ENTRY_MIN
+                    if (hh > 8 or (hh == 8 and mm >= 30)) and (hh < 11 or (hh == 11 and mm == 0)):
+                        atr_min_use = max(atr_min_use, 8.0)
+                    if not (atr_min_use <= atr <= ATR_ENTRY_MAX):
+                        continue
             if np.isnan(donch_high) or np.isnan(donch_low) or np.isnan(ema_1h):
                 continue
 
