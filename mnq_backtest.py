@@ -138,10 +138,10 @@ def _parse_band_map(raw: str):
 ATR_BAND_MAP = _parse_band_map(os.environ.get("TOPSTEP_ATR_ENTRY_BANDS", ""))
 # Lower, sensible default $ATR bands if none provided via env
 DEFAULT_DATR_BANDS = {
-    "MNQ": (12.0, 30.0),
-    "MES": (12.0, 30.0),
-    "MYM": (6.0, 20.0),
-    "M2K": (20.0, 50.0),
+    "MNQ": (6.0, 30.0),
+    "MES": (5.0, 25.0),
+    "MYM": (2.0, 10.0),
+    "M2K": (1.0, 10.0),
 }
 _DATR_ENV = _parse_band_map(os.environ.get("TOPSTEP_DATR_ENTRY_BANDS", ""))
 DATR_BAND_MAP = {**DEFAULT_DATR_BANDS, **_DATR_ENV}

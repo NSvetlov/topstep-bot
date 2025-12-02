@@ -202,11 +202,12 @@ def main():
     atr_band_map: Dict[str, Tuple[float, float]] = _parse_band_map(os.environ.get("TOPSTEP_ATR_ENTRY_BANDS", ""))
     datr_band_map_env: Dict[str, Tuple[float, float]] = _parse_band_map(os.environ.get("TOPSTEP_DATR_ENTRY_BANDS", ""))
     # Lower, sensible default $ATR bands if none provided via env
+    # Built-in lower defaults (overridden by TOPSTEP_DATR_ENTRY_BANDS if set)
     DEFAULT_DATR_BANDS: Dict[str, Tuple[float, float]] = {
-        "MNQ": (12.0, 30.0),
-        "MES": (12.0, 30.0),
-        "MYM": (6.0, 20.0),
-        "M2K": (20.0, 50.0),
+        "MNQ": (6.0, 30.0),
+        "MES": (5.0, 25.0),
+        "MYM": (2.0, 10.0),
+        "M2K": (1.0, 10.0),
     }
     # Merge env over defaults
     datr_band_map: Dict[str, Tuple[float, float]] = {**DEFAULT_DATR_BANDS, **datr_band_map_env}
