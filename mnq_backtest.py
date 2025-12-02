@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -46,7 +47,7 @@ ATR_TRAIL2_MULT = 1.0             # legacy
 
 # OU-style pullback (still computed, but not used in entry now)
 N_DEV = 40
-Z_ENTRY = 0.8
+Z_ENTRY = 1.0
 Z_EXIT = 0.1
 
 # Swing high/low lookback for structural stop (not central any more)
@@ -56,7 +57,7 @@ STOP_BUFFER_POINTS = 0.75
 # Risk
 MULTIPLIER = 2.0           # MNQ $2 per index point per contract
 MAX_CONTRACTS = 10         # cap MNQ size for safer trend-following
-MIN_QTY = 2                # minimum contracts per entry (risk-based floor)
+MIN_QTY = 1                # minimum contracts per entry (risk-based floor)
 RISK_PER_TRADE = 80.0      # target dollar risk per trade
 MAX_TRADE_RISK = 500.0     # legacy
 DAILY_LOSS_LIMIT = -250.0  # hard daily loss cap
@@ -82,20 +83,69 @@ REOPEN_SKIP_MINUTES = 5  # skip first minutes after 5pm CT reopen
 # Time stop (bars)
 # Live-aligned exit settings for backtest
 # These mirror defaults in live_trade_topstep.py
-ATR_STOP_MULT = 2.0
-BE_TRIGGER_ATR = 1.0
-BE_OFFSET_ATR = 0.25
-TRAIL1_TRIGGER_ATR = 2.0
-TRAIL1_MULT = 1.5
-TRAIL2_TRIGGER_ATR = 3.0
-TRAIL2_MULT = 1.0
-TIME_STOP_MIN = 120  # minutes
+ATR_STOP_MULT = 1.25
+BE_TRIGGER_ATR = 1.5
+BE_OFFSET_ATR = 0.10
+TRAIL1_TRIGGER_ATR = 2.5
+TRAIL1_MULT = 2.0
+TRAIL2_TRIGGER_ATR = 4.0
+TRAIL2_MULT = 1.5
+TRAIL3_TRIGGER_ATR = 5.0
+TRAIL3_MULT = 1.25
+TIME_STOP_MIN = 90  # minutes
+TIME_STOP_EXT_MIN = 60  # extend time stop by 60 minutes if progress >= 1x ATR
 EXHAUSTION_ATR_MULT = 4.0  # overshoot threshold vs hourly EMA (backtest-only)
+
+# Pyramiding (adds on favorable movement)
+PYRAMID_ENABLED = True
+PYRAMID_STEP_ATR = 1.5
+PYRAMID_ADD_QTY = 1
 
 STARTING_CAPITAL = 100_000.0
 
 # Donchian settings (15m trend-following entries)
 DONCHIAN_LEN = 20
+
+# Per-ticker point values (for $ATR filtering)
+PNT_VALUE = {
+    "MNQ": 2.0,
+    "MES": 5.0,
+    "MYM": 0.5,
+    "M2K": 5.0,
+}
+
+def point_value_for(symbol: str) -> float:
+    return float(PNT_VALUE.get(symbol.upper(), MULTIPLIER))
+
+def _parse_band_map(raw: str):
+    m = {}
+    for seg in raw.split(";"):
+        seg = seg.strip()
+        if not seg or ":" not in seg or "-" not in seg:
+            continue
+        sym, rng = seg.split(":", 1)
+        sym = sym.strip().upper()
+        try:
+            lo_s, hi_s = rng.split("-", 1)
+            lo = float(lo_s.strip())
+            hi = float(hi_s.strip())
+            if lo > 0 and hi > 0 and hi >= lo:
+                m[sym] = (lo, hi)
+        except Exception:
+            pass
+    return m
+
+ATR_BAND_MAP = _parse_band_map(os.environ.get("TOPSTEP_ATR_ENTRY_BANDS", ""))
+# Lower, sensible default $ATR bands if none provided via env
+DEFAULT_DATR_BANDS = {
+    "MNQ": (12.0, 30.0),
+    "MES": (12.0, 30.0),
+    "MYM": (6.0, 20.0),
+    "M2K": (20.0, 50.0),
+}
+_DATR_ENV = _parse_band_map(os.environ.get("TOPSTEP_DATR_ENTRY_BANDS", ""))
+DATR_BAND_MAP = {**DEFAULT_DATR_BANDS, **_DATR_ENV}
+BASE_SYMBOL = (TICKER.split("=")[0] if "=" in TICKER else TICKER).strip().upper()
 
 
 @dataclass
@@ -108,6 +158,17 @@ class Trade:
     qty: int
     pnl: float
     reason: str
+    # Added for logging/analysis
+    initial_stop: Optional[float] = None     # stop price at entry, based on ATR
+    atr_at_entry: Optional[float] = None     # ATR value at entry
+    stop_points_entry: Optional[float] = None  # 2x ATR distance (points) used for initial stop
+    mode: Optional[str] = None               # 'TREND' or 'MR'
+    # New diagnostics
+    is_full_exit: bool = True                # False for partial records
+    mfe_points: Optional[float] = None       # max favorable excursion in points
+    mfe_price_at_exit: Optional[float] = None
+    entry_qty: Optional[int] = None         # size at entry
+    max_qty: Optional[int] = None           # max size reached (with pyramiding)
 
 
 # =========================
@@ -331,8 +392,8 @@ def in_entry_session(ts: pd.Timestamp) -> bool:
     """Allow entries only in specific liquid windows (US/Central):
     - 08:30–11:00 (US open)
     - 12:45–15:00 (US afternoon)
-    - 19:00–22:00 (Asia open)
     - 02:00–04:00 (London open)
+    (Asian session 19:00–22:00 is excluded for backtest entries)
     """
     t = ts
 
@@ -344,7 +405,6 @@ def in_entry_session(ts: pd.Timestamp) -> bool:
     return (
         in_window(8, 30, 11, 0) or
         in_window(12, 45, 15, 0) or
-        in_window(19, 0, 22, 0) or
         in_window(2, 0, 4, 0)
     )
 
@@ -371,7 +431,7 @@ def past_force_flat(ts: pd.Timestamp) -> bool:
 # Backtest engine
 # =========================
 
-def backtest(df: pd.DataFrame):
+def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
     position = 0  # +qty for long, -qty for short
     entry_price: Optional[float] = None
     stop_price: Optional[float] = None
@@ -414,7 +474,54 @@ def backtest(df: pd.DataFrame):
     # Cooldown after stop per direction (optional; kept)
     last_stop_i_long = -10**9
     last_stop_i_short = -10**9
-    COOLDOWN_BARS = 5  # base TF bars to wait after a stop in same direction
+    COOLDOWN_BARS = 0  # cooldown disabled to mirror live behavior
+
+    # Mode hysteresis
+    last_mode: Optional[str] = None  # 'TREND', 'MR', or None
+
+    # Thresholds for regime scoring
+    ADX_TREND = 25.0
+    ADX_MR = 12.0
+    BB_EXPAND_MULT = 1.3
+    BB_SQUEEZE_MULT = 0.75
+    MR_MAX_HALF_LIFE = 45.0  # minutes on base TF
+
+    def decide_mode(row) -> Optional[str]:
+        nonlocal last_mode
+        # Inputs
+        regime = classify_regime(row)
+        adx = float(row.get("adx14") or np.nan)
+        bb_bw = float(row.get("bb_bw_5") or np.nan)
+        bb_bw_ma = float(row.get("bb_bw_ma_5") or np.nan)
+        hl = float(row.get("half_life") or np.nan)
+
+        trend_score = 0
+        mr_score = 0
+        if regime in ("UP", "DOWN"):
+            trend_score += 1
+        if not np.isnan(adx) and adx >= ADX_TREND:
+            trend_score += 1
+        if (not np.isnan(bb_bw)) and (not np.isnan(bb_bw_ma)) and bb_bw_ma != 0 and (bb_bw >= BB_EXPAND_MULT * bb_bw_ma):
+            trend_score += 1
+
+        if (not np.isnan(hl)) and hl > 0 and hl <= MR_MAX_HALF_LIFE:
+            mr_score += 1
+        if not np.isnan(adx) and adx <= ADX_MR:
+            mr_score += 1
+        if (not np.isnan(bb_bw)) and (not np.isnan(bb_bw_ma)) and bb_bw_ma != 0 and (bb_bw <= BB_SQUEEZE_MULT * bb_bw_ma):
+            mr_score += 1
+
+        mode: Optional[str]
+        if trend_score - mr_score >= 1:
+            mode = "TREND"
+        elif mr_score - trend_score >= 1:
+            mode = None  # MR disabled
+        else:
+            mode = last_mode  # hysteresis: keep prior mode if indecisive
+        last_mode = mode
+        return mode
+
+    position_mode: Optional[str] = None
 
     for i in range(len(df)):
         row = df.iloc[i]
@@ -463,29 +570,85 @@ def backtest(df: pd.DataFrame):
                 # Initial stop from entry ATR (kept from entry)
                 if direction == "LONG":
                     base_stop = entry_price - ATR_STOP_MULT * atr_at_entry
-                    stop_price = max(stop_price, base_stop)
+                    MIN_STOP_STEP_ATR = 0.25
+                    if base_stop > stop_price + MIN_STOP_STEP_ATR * atr_at_entry:
+                        stop_price = base_stop
                 else:
                     base_stop = entry_price + ATR_STOP_MULT * atr_at_entry
-                    stop_price = min(stop_price, base_stop)
+                    if base_stop < stop_price - MIN_STOP_STEP_ATR * atr_at_entry:
+                        stop_price = base_stop
 
                 # Breakeven once price moves in favor by BE_TRIGGER_ATR
                 if move_fav >= BE_TRIGGER_ATR * atr_at_entry:
                     if direction == "LONG":
-                        stop_price = max(stop_price, entry_price + BE_OFFSET_ATR * atr_at_entry)
+                        target = entry_price + BE_OFFSET_ATR * atr_at_entry
+                        if target > stop_price + MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
                     else:
-                        stop_price = min(stop_price, entry_price - BE_OFFSET_ATR * atr_at_entry)
+                        target = entry_price - BE_OFFSET_ATR * atr_at_entry
+                        if target < stop_price - MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
 
                 # Tiered ATR trailing using MFE
                 if move_fav >= TRAIL1_TRIGGER_ATR * atr_at_entry:
+                    target = (mfe_price - TRAIL1_MULT * atr_at_entry) if direction == "LONG" else (mfe_price + TRAIL1_MULT * atr_at_entry)
                     if direction == "LONG":
-                        stop_price = max(stop_price, mfe_price - TRAIL1_MULT * atr_at_entry)
+                        if target > stop_price + MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
                     else:
-                        stop_price = min(stop_price, mfe_price + TRAIL1_MULT * atr_at_entry)
+                        if target < stop_price - MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
                 if move_fav >= TRAIL2_TRIGGER_ATR * atr_at_entry:
+                    target = (mfe_price - TRAIL2_MULT * atr_at_entry) if direction == "LONG" else (mfe_price + TRAIL2_MULT * atr_at_entry)
                     if direction == "LONG":
-                        stop_price = max(stop_price, mfe_price - TRAIL2_MULT * atr_at_entry)
+                        if target > stop_price + MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
                     else:
-                        stop_price = min(stop_price, mfe_price + TRAIL2_MULT * atr_at_entry)
+                        if target < stop_price - MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
+                if move_fav >= TRAIL3_TRIGGER_ATR * atr_at_entry:
+                    target = (mfe_price - TRAIL3_MULT * atr_at_entry) if direction == "LONG" else (mfe_price + TRAIL3_MULT * atr_at_entry)
+                    if direction == "LONG":
+                        if target > stop_price + MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
+                    else:
+                        if target < stop_price - MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
+
+                # Ratchet stop once move_fav is large enough
+                if move_fav >= 3.0 * atr_at_entry:
+                    if direction == "LONG":
+                        target = entry_price + 0.5 * atr_at_entry
+                        if target > stop_price + MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
+                    else:
+                        target = entry_price - 0.5 * atr_at_entry
+                        if target < stop_price - MIN_STOP_STEP_ATR * atr_at_entry:
+                            stop_price = target
+
+            # Pyramiding: add on favorable moves at ATR steps
+            if PYRAMID_ENABLED and atr_at_entry and not np.isnan(atr_at_entry) and qty < MAX_CONTRACTS:
+                try:
+                    pyr_count
+                except NameError:
+                    pyr_count = 0
+                next_level = (pyr_count + 1) * PYRAMID_STEP_ATR * atr_at_entry
+                if move_fav >= next_level:
+                    add_qty = min(PYRAMID_ADD_QTY, MAX_CONTRACTS - qty)
+                    if add_qty > 0:
+                        qty += add_qty
+                        position = qty if direction == "LONG" else -qty
+                        pyr_count += 1
+                        max_qty_local = max(max_qty_local, qty)
+
+            # 0b) Hard dollar stop (additional tail guard)
+            HARD_DLR_STOP = 150.0
+            if not exited:
+                unreal_now = ((close - entry_price) if direction == "LONG" else (entry_price - close)) * qty * MULTIPLIER
+                if unreal_now <= -HARD_DLR_STOP:
+                    exit_reason = "HARD_DLR_STOP"
+                    exit_price = close
+                    exited = True
 
             # 1) Hard stop
             if not exited:
@@ -511,7 +674,75 @@ def backtest(df: pd.DataFrame):
                     exit_reason = "STOP"
                     exited = True
 
-            # 3) Exhaustion exit: price too far from hourly EMA (overshoot)
+            # TREND partials at +1.5×ATR and +3.0×ATR
+            if not exited and position_mode == "TREND" and qty >= 2 and atr_at_entry and not np.isnan(atr_at_entry):
+                move_fav = (close - entry_price) if direction == "LONG" else (entry_price - close)
+                # Initialize flags on first use
+                if 'pos_trend_partial1_done' not in locals():
+                    pos_trend_partial1_done = False
+                if 'pos_trend_partial2_done' not in locals():
+                    pos_trend_partial2_done = False
+
+                # First partial at 1.5×ATR
+                if (not pos_trend_partial1_done) and move_fav >= 1.5 * atr_at_entry:
+                    part_qty = max(1, qty // 3)
+                    px = close
+                    pnl_part = ((px - entry_price) if direction == "LONG" else (entry_price - px)) * part_qty * MULTIPLIER
+                    realized_pnl += pnl_part
+                    daily_pnl += pnl_part
+                    trades.append(Trade(
+                        direction=direction,
+                        entry_time=df.index[entry_index],
+                        exit_time=ts,
+                        entry_price=entry_price,
+                        exit_price=px,
+                        qty=part_qty,
+                        pnl=pnl_part,
+                        reason="TREND_PARTIAL_ATR",
+                        initial_stop=(entry_price - stop_points_entry) if direction == "LONG" else (entry_price + stop_points_entry),
+                        atr_at_entry=atr_at_entry,
+                        stop_points_entry=stop_points_entry,
+                        mode=position_mode,
+                        is_full_exit=False,
+                        mfe_points=(max(0.0, float(mfe_price - entry_price)) if entry_price is not None and mfe_price is not None and direction == "LONG" else (max(0.0, float(entry_price - mfe_price)) if entry_price is not None and mfe_price is not None else None)),
+                        mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
+                    ))
+                    qty = qty - part_qty
+                    position = qty if direction == "LONG" else -qty
+                    pos_trend_partial1_done = True
+
+                # Second partial at 3.0×ATR
+                if (not exited) and qty >= 2 and (not pos_trend_partial2_done) and move_fav >= 3.0 * atr_at_entry:
+                    part_qty = max(1, qty // 3)
+                    px = close
+                    pnl_part = ((px - entry_price) if direction == "LONG" else (entry_price - px)) * part_qty * MULTIPLIER
+                    realized_pnl += pnl_part
+                    daily_pnl += pnl_part
+                    trades.append(Trade(
+                        direction=direction,
+                        entry_time=df.index[entry_index],
+                        exit_time=ts,
+                        entry_price=entry_price,
+                        exit_price=px,
+                        qty=part_qty,
+                        pnl=pnl_part,
+                        reason="TREND_PARTIAL2_ATR",
+                        initial_stop=(entry_price - stop_points_entry) if direction == "LONG" else (entry_price + stop_points_entry),
+                        atr_at_entry=atr_at_entry,
+                        stop_points_entry=stop_points_entry,
+                        mode=position_mode,
+                        is_full_exit=False,
+                        mfe_points=(max(0.0, float(mfe_price - entry_price)) if entry_price is not None and mfe_price is not None and direction == "LONG" else (max(0.0, float(entry_price - mfe_price)) if entry_price is not None and mfe_price is not None else None)),
+                        mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
+                    ))
+                    qty = qty - part_qty
+                    position = qty if direction == "LONG" else -qty
+                    pos_trend_partial2_done = True
+
+            # MR exits disabled (no MR positions created)
+
+            # 3) Exhaustion: prefer runner (partial) and require ADX rollover + profit
+            EXH_MIN_PROFIT_ATR = 0.5
             if not exited:
                 ema_1h = row.get("ema_1h_50", np.nan)
                 atr_now = row.get("atr", np.nan)
@@ -520,14 +751,49 @@ def backtest(df: pd.DataFrame):
                     and atr_now is not None and not np.isnan(atr_now)
                     and atr_now > 0
                 ):
-                    if direction == "LONG" and close > ema_1h + EXHAUSTION_ATR_MULT * atr_now:
-                        exit_reason = "EXHAUSTION"
-                        exit_price = close
-                        exited = True
-                    elif direction == "SHORT" and close < ema_1h - EXHAUSTION_ATR_MULT * atr_now:
-                        exit_reason = "EXHAUSTION"
-                        exit_price = close
-                        exited = True
+                    unreal_now = ((close - entry_price) if direction == "LONG" else (entry_price - close)) * qty * MULTIPLIER
+                    min_profit_dlr = EXH_MIN_PROFIT_ATR * atr_now * MULTIPLIER * qty
+                    adx_now = row.get("adx14", np.nan)
+                    adx_prev = df["adx14"].iloc[i-1] if i > 0 else np.nan
+                    adx_rollover = (not np.isnan(adx_now)) and (not np.isnan(adx_prev)) and (adx_now < adx_prev)
+
+                    trigger_long = direction == "LONG" and close > ema_1h + EXHAUSTION_ATR_MULT * atr_now
+                    trigger_short = direction == "SHORT" and close < ema_1h - EXHAUSTION_ATR_MULT * atr_now
+                    if (trigger_long or trigger_short) and unreal_now >= min_profit_dlr and adx_rollover and qty >= 2:
+                        part_qty = max(1, qty // 2)
+                        px = close
+                        pnl_part = ((px - entry_price) if direction == "LONG" else (entry_price - px)) * part_qty * MULTIPLIER
+                        realized_pnl += pnl_part
+                        daily_pnl += pnl_part
+                        init_stop = (
+                            (entry_price - stop_points_entry)
+                            if (stop_points_entry is not None and entry_price is not None and direction == "LONG")
+                            else (
+                                (entry_price + stop_points_entry)
+                                if (stop_points_entry is not None and entry_price is not None and direction == "SHORT")
+                                else None
+                            )
+                        )
+                        trades.append(Trade(
+                            direction=direction,
+                            entry_time=df.index[entry_index],
+                            exit_time=ts,
+                            entry_price=entry_price,
+                            exit_price=px,
+                            qty=part_qty,
+                            pnl=pnl_part,
+                            reason="EXHAUSTION_PARTIAL",
+                            initial_stop=init_stop,
+                            atr_at_entry=atr_at_entry,
+                            stop_points_entry=stop_points_entry,
+                            mode=position_mode,
+                            is_full_exit=False,
+                            mfe_points=(max(0.0, float(mfe_price - entry_price)) if entry_price is not None and mfe_price is not None and direction == "LONG" else (max(0.0, float(entry_price - mfe_price)) if entry_price is not None and mfe_price is not None else None)),
+                            mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
+                        ))
+                        # Reduce position; keep runner
+                        position = (qty - part_qty) if direction == "LONG" else -(qty - part_qty)
+                        qty = abs(position)
 
             # 4) force-flat time (maintenance window)
             if not exited and past_force_flat(ts):
@@ -535,10 +801,17 @@ def backtest(df: pd.DataFrame):
                 exit_price = close
                 exited = True
 
-            # 5) time-stop (live-aligned); no regime-flip exit
+            # 5) time-stop (adaptive)
             if not exited and entry_time is not None:
                 minutes_in_trade = (ts - entry_time).total_seconds() / 60.0
-                if minutes_in_trade >= TIME_STOP_MIN:
+                eff_time_stop = TIME_STOP_MIN
+                try:
+                    move_fav_ts = (close - entry_price) if direction == "LONG" else (entry_price - close)
+                    if atr_at_entry and move_fav_ts >= 1.0 * atr_at_entry:
+                        eff_time_stop = TIME_STOP_MIN + TIME_STOP_EXT_MIN
+                except Exception:
+                    pass
+                if minutes_in_trade >= eff_time_stop:
                     exit_reason = "TIME_STOP"
                     exit_price = close
                     exited = True
@@ -552,6 +825,19 @@ def backtest(df: pd.DataFrame):
                 realized_pnl += pnl
                 daily_pnl += pnl
 
+                # Derive initial stop from entry context for logging
+                init_stop: Optional[float] = None
+                if entry_price is not None and stop_points_entry is not None:
+                    init_stop = entry_price - stop_points_entry if direction == "LONG" else entry_price + stop_points_entry
+
+                # MFE in points
+                mfe_pts: Optional[float] = None
+                if mfe_price is not None and entry_price is not None:
+                    if direction == "LONG":
+                        mfe_pts = max(0.0, float(mfe_price) - float(entry_price))
+                    else:
+                        mfe_pts = max(0.0, float(entry_price) - float(mfe_price))
+
                 trades.append(
                     Trade(
                         direction=direction,
@@ -562,6 +848,15 @@ def backtest(df: pd.DataFrame):
                         qty=qty,
                         pnl=pnl,
                         reason=exit_reason,
+                        initial_stop=init_stop,
+                        atr_at_entry=atr_at_entry,
+                        stop_points_entry=stop_points_entry,
+                        mode=position_mode,
+                        is_full_exit=True,
+                        mfe_points=mfe_pts,
+                        mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
+                        entry_qty=entry_qty_local,
+                        max_qty=max_qty_local,
                     )
                 )
 
@@ -609,6 +904,12 @@ def backtest(df: pd.DataFrame):
                     pnl_part = (px - entry_price) * part_qty * MULTIPLIER
                     realized_pnl += pnl_part
                     daily_pnl += pnl_part
+                    # Partial realization record (keep initial stop context)
+                    init_stop = (
+                        (entry_price - stop_points_entry)
+                        if (stop_points_entry is not None and entry_price is not None)
+                        else (entry_price - 2.0 * atr_at_entry if atr_at_entry is not None and entry_price is not None else None)
+                    )
                     trades.append(Trade(
                         direction=direction,
                         entry_time=df.index[entry_index],
@@ -618,6 +919,12 @@ def backtest(df: pd.DataFrame):
                         qty=part_qty,
                         pnl=pnl_part,
                         reason="PARTIAL_TP",
+                        initial_stop=init_stop,
+                        atr_at_entry=atr_at_entry,
+                        stop_points_entry=stop_points_entry,
+                        is_full_exit=False,
+                        mfe_points=(max(0.0, float(mfe_price - entry_price)) if entry_price is not None and mfe_price is not None and direction == "LONG" else (max(0.0, float(entry_price - mfe_price)) if entry_price is not None and mfe_price is not None else None)),
+                        mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
                     ))
                     position -= part_qty
                 elif direction == "SHORT" and low <= entry_price - PARTIAL_AT_POINTS:
@@ -625,6 +932,11 @@ def backtest(df: pd.DataFrame):
                     pnl_part = (entry_price - px) * part_qty * MULTIPLIER
                     realized_pnl += pnl_part
                     daily_pnl += pnl_part
+                    init_stop = (
+                        (entry_price + stop_points_entry)
+                        if (stop_points_entry is not None and entry_price is not None)
+                        else (entry_price + 2.0 * atr_at_entry if atr_at_entry is not None and entry_price is not None else None)
+                    )
                     trades.append(Trade(
                         direction=direction,
                         entry_time=df.index[entry_index],
@@ -634,6 +946,12 @@ def backtest(df: pd.DataFrame):
                         qty=part_qty,
                         pnl=pnl_part,
                         reason="PARTIAL_TP",
+                        initial_stop=init_stop,
+                        atr_at_entry=atr_at_entry,
+                        stop_points_entry=stop_points_entry,
+                        is_full_exit=False,
+                        mfe_points=(max(0.0, float(mfe_price - entry_price)) if entry_price is not None and mfe_price is not None and direction == "LONG" else (max(0.0, float(entry_price - mfe_price)) if entry_price is not None and mfe_price is not None else None)),
+                        mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
                     ))
                     position += part_qty
 
@@ -656,6 +974,9 @@ def backtest(df: pd.DataFrame):
                     pnl = (entry_price - exit_price) * qty * MULTIPLIER
                 realized_pnl += pnl
                 daily_pnl += pnl
+                init_stop = None
+                if entry_price is not None and atr_at_entry is not None:
+                    init_stop = entry_price - 2.0 * atr_at_entry if direction == "LONG" else entry_price + 2.0 * atr_at_entry
                 trades.append(
                     Trade(
                         direction=direction,
@@ -666,6 +987,9 @@ def backtest(df: pd.DataFrame):
                         qty=qty,
                         pnl=pnl,
                         reason="MAX_DD_LIQUIDATION",
+                        initial_stop=init_stop,
+                        atr_at_entry=atr_at_entry,
+                        stop_points_entry=stop_points_entry,
                     )
                 )
                 position = 0
@@ -691,18 +1015,42 @@ def backtest(df: pd.DataFrame):
 
             if atr is None or np.isnan(atr) or atr <= 0:
                 continue
+            # ATR/$ATR entry bands per symbol with fallback to global and RTH uplift
+            ATR_ENTRY_MIN = 6.0
+            ATR_ENTRY_MAX = 20.0
+            hh = ts.hour
+            mm = ts.minute
+            sym = (base_symbol or BASE_SYMBOL or "MNQ").upper()
+            pv_here = point_value_for(sym)
+            datr = atr * pv_here
+            if sym in DATR_BAND_MAP:
+                lo, hi = DATR_BAND_MAP[sym]
+                if not (lo <= datr <= hi):
+                    continue
+            elif sym in ATR_BAND_MAP:
+                lo, hi = ATR_BAND_MAP[sym]
+                if not (lo <= atr <= hi):
+                    continue
+            else:
+                atr_min_use = ATR_ENTRY_MIN
+                if (hh > 8 or (hh == 8 and mm >= 30)) and (hh < 11 or (hh == 11 and mm == 0)):
+                    atr_min_use = max(atr_min_use, 8.0)
+                if not (atr_min_use <= atr <= ATR_ENTRY_MAX):
+                    continue
             if np.isnan(donch_high) or np.isnan(donch_low) or np.isnan(ema_1h):
                 continue
 
+            mode = decide_mode(row)
             long_signal = False
             short_signal = False
 
-            # Early trend breakout in direction of hourly trend
-            # (overshoot is handled on exit, not at entry)
-            if regime == "UP" and close > donch_high:
-                long_signal = True
-            elif regime == "DOWN" and close < donch_low:
-                short_signal = True
+            if mode == "TREND":
+                # Early trend breakout in direction of hourly trend
+                if regime == "UP" and close > donch_high:
+                    long_signal = True
+                elif regime == "DOWN" and close < donch_low:
+                    short_signal = True
+            # MR entries disabled
 
             if long_signal:
                 stats["long_signal"] += 1
@@ -751,10 +1099,15 @@ def backtest(df: pd.DataFrame):
                 stop_points_entry = stop_points
                 mfe_price = entry_price
                 total_positions += 1
+                position_mode = mode
                 realized_at_entry = realized_pnl
                 pos_reached18 = False
                 pos_reached30 = False
                 daily_trades += 1
+                # Track entry and max qty for analytics
+                entry_qty_local = qty
+                max_qty_local = qty
+                pyr_count = 0
 
         # record equity
         equity_curve.append(STARTING_CAPITAL + realized_pnl)
@@ -814,6 +1167,21 @@ def summarize_trades(trades: List[Trade]):
     print(f"Gross loss: {gross_loss:.2f}")
     print(f"Net PnL: {net:.2f}")
 
+    # Losing trades that were in profit (MFE>0)
+    try:
+        losers = df_trades[(df_trades["pnl"] < 0) & (df_trades["is_full_exit"] == True)]
+        losers_were_winning = losers[losers["mfe_points"].fillna(0) > 0]
+        n_losers = int(len(losers))
+        n_were_win = int(len(losers_were_winning))
+        pct = (100.0 * n_were_win / n_losers) if n_losers > 0 else 0.0
+        print(f"\nLosing full exits that were winning at some point: {n_were_win}/{n_losers} ({pct:.1f}%)")
+        if n_were_win > 0:
+            print(
+                f"MFE (pts) on those losers: median={losers_were_winning['mfe_points'].median():.2f}, mean={losers_were_winning['mfe_points'].mean():.2f}"
+            )
+    except Exception as e:
+        print(f"Analysis error (MFE on losers): {e}")
+
     print("\nSample trades:")
     print(df_trades.head())
 
@@ -828,6 +1196,14 @@ def summarize_trades(trades: List[Trade]):
             print(f"Saved trades to {alt_name} (mnq_trades.csv was locked).")
         except Exception as e:
             print(f"Could not save trades CSV: {e}")
+
+
+def trades_to_df(trades: List[Trade]) -> pd.DataFrame:
+    try:
+        import pandas as pd  # type: ignore
+    except Exception:
+        raise
+    return pd.DataFrame([t.__dict__ for t in trades])
 
 
 def plot_equity(equity: pd.Series):
@@ -859,34 +1235,97 @@ def plot_daily_pnl(equity: pd.Series, target_per_day: float = 1000.0):
 
 
 def main():
-    print("Downloading MNQ data...")
-    df = load_mnq_data()
-    print(f"1m/7d: Got {len(df)} bars from {df.index[0]} to {df.index[-1]}")
+    tickers_env = os.environ.get("BACKTEST_TICKERS") or os.environ.get("TOPSTEP_MICRO_TICKERS")
+    if tickers_env:
+        tickers = [t.strip() for t in tickers_env.split(",") if t.strip()]
+    else:
+        tickers = [TICKER]
 
-    print("Running backtest (1m/7d)...")
-    trades, equity = backtest(df)
+    all_dfs = []
+    all_equities = []
+    for tkr in tickers:
+        try:
+            print(f"Downloading data for {tkr}...")
+            df = load_mnq_data(ticker=tkr)
+            if df.empty:
+                print(f"No data for {tkr}; skipping.")
+                continue
+            print(f"{tkr}: Got {len(df)} bars from {df.index[0]} to {df.index[-1]}")
 
-    summarize_trades(trades)
+            base_symbol = (tkr.split("=")[0] if "=" in tkr else tkr).strip().upper()
+            print(f"Running backtest for {base_symbol} (1m/7d)...")
+            trades, equity = backtest(df, base_symbol=base_symbol)
 
-    # Debug: plot half-life over time
-    plt.figure(figsize=(10, 4))
-    df["half_life"].plot()
-    plt.title("Estimated OU Half-life")
-    plt.tight_layout()
-    plt.show()
+            # Per-ticker summary
+            print(f"\n=== Summary for {base_symbol} ===")
+            summarize_trades(trades)
 
-    plot_equity(equity)
-    # Plot daily PnL bars vs $1,000 benchmark
-    plot_daily_pnl(equity, target_per_day=1000.0)
+            # Collect for aggregate CSV
+            try:
+                df_tr = trades_to_df(trades)
+                df_tr["symbol"] = base_symbol
+                all_dfs.append(df_tr)
+            except Exception:
+                pass
+            all_equities.append((base_symbol, equity))
+        except Exception as e:
+            print(f"Error backtesting {tkr}: {e}")
 
-    # Longer backtest using higher interval/period for broader coverage
-    print("\nDownloading MNQ data for long backtest (5m/60d)...")
-    df_long = load_mnq_data(interval="5m", period="60d")
-    print(f"5m/60d: Got {len(df_long)} bars from {df_long.index[0]} to {df_long.index[-1]}")
-    print("Running backtest (5m/60d)...")
-    trades_long, equity_long = backtest(df_long)
-    summarize_trades(trades_long)
-    plot_equity(equity_long)
+    # Aggregate CSV if multiple tickers
+    if all_dfs:
+        try:
+            import pandas as pd  # type: ignore
+            df_all = pd.concat(all_dfs, ignore_index=True)
+            out = "mnq_trades_all.csv" if len(tickers) > 1 else "mnq_trades.csv"
+            df_all.to_csv(out, index=False)
+            print(f"Saved aggregated trades to {out}")
+        except Exception as e:
+            print(f"Could not save aggregated CSV: {e}")
+
+        # Per-symbol summary table + aggregate
+        try:
+            import pandas as pd  # type: ignore
+            df_all["pnl"] = pd.to_numeric(df_all["pnl"], errors="coerce")
+            df_all_clean = df_all.dropna(subset=["pnl"])  # ignore NaNs
+
+            def _sumstats(df_sym: pd.DataFrame) -> dict:
+                pnl = df_sym["pnl"]
+                wins = (pnl > 0).sum()
+                losses = (pnl < 0).sum()
+                total = len(df_sym)
+                win_rate = (wins / total * 100.0) if total else 0.0
+                return {
+                    "n": total,
+                    "wins": int(wins),
+                    "losses": int(losses),
+                    "win_rate%": round(win_rate, 1),
+                    "net": round(float(pnl.sum()), 2),
+                    "avg": round(float(pnl.mean()) if total else 0.0, 2),
+                    "best": round(float(pnl.max()) if total else 0.0, 2),
+                    "worst": round(float(pnl.min()) if total else 0.0, 2),
+                }
+
+            if "symbol" in df_all_clean.columns:
+                print("\n=== Per-symbol summary ===")
+                rows = []
+                for sym, grp in df_all_clean.groupby("symbol"):
+                    rows.append((sym, _sumstats(grp)))
+                # pretty print
+                for sym, s in rows:
+                    print(f"{sym:>4} | n={s['n']:4d} wins={s['wins']:4d} losses={s['losses']:4d} win%={s['win_rate%']:5.1f} net={s['net']:8.2f} avg={s['avg']:6.2f} best={s['best']:7.2f} worst={s['worst']:7.2f}")
+
+            # Aggregate summary across all symbols
+            s_all = _sumstats(df_all_clean)
+            print("\n=== Aggregate summary (all symbols) ===")
+            print(f"n={s_all['n']} wins={s_all['wins']} losses={s_all['losses']} win%={s_all['win_rate%']:.1f} net={s_all['net']:.2f} avg={s_all['avg']:.2f} best={s_all['best']:.2f} worst={s_all['worst']:.2f}")
+        except Exception as e:
+            print(f"Could not compute summary table: {e}")
+
+    # Plot equity for the first ticker only (to keep UI manageable)
+    if all_equities:
+        sym0, eq0 = all_equities[0]
+        plot_equity(eq0)
+        plot_daily_pnl(eq0, target_per_day=1000.0)
 
 
 if __name__ == "__main__":
