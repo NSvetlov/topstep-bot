@@ -684,48 +684,52 @@ def main():
                     mfe_price = min(mfe_price, last_close)
                 rec["mfe_price"] = mfe_price
 
-                # Pyramiding: add on favorable moves at ATR steps
-                if PYRAMID_ENABLED and atr_entry > 0 and p_qty < MAX_CONTRACTS:
+                # Exit rules (only if position is live and we haven't already sent an exit)
+                qty_live = int(active_contracts.get(cid, 0))
+
+                # Pyramiding: add on favorable moves at ATR steps, respecting live size cap
+                if PYRAMID_ENABLED and atr_entry > 0:
                     try:
                         pyr_count = int(rec.get("pyr_count", 0))
                     except Exception:
                         pyr_count = 0
-                    next_level = (pyr_count + 1) * PYRAMID_STEP_ATR * atr_entry
-                    move_fav_now = (last_close - p_entry) if p_side == "LONG" else (p_entry - last_close)
-                    if move_fav_now >= next_level:
-                        add_qty = min(PYRAMID_ADD_QTY, MAX_CONTRACTS - p_qty)
-                        if add_qty > 0:
-                            try:
-                                add_side = "BUY" if p_side == "LONG" else "SELL"
-                                resp_add = client.place_market_order(
-                                    account_id=account_id,
-                                    contract_id=cid,
-                                    side=add_side,
-                                    size=int(add_qty),
-                                    stop_ticks=None,
-                                    take_ticks=None,
-                                )
-                                rec["qty"] = p_qty + add_qty
-                                rec["pyr_count"] = pyr_count + 1
-                                print(f"{now_dt}: PYRAMID {add_side} {add_qty} {base} (contract {cid}) -> {resp_add}")
-                                # refresh p_qty for downstream calc
-                                p_qty = rec["qty"]
-                                _log_trade("ADD", {
-                                    "ts": now_dt,
-                                    "account_id": account_id,
-                                    "symbol": base,
-                                    "contract_id": cid,
-                                    "side": p_side,
-                                    "qty": int(add_qty),
-                                    "entry_price": float(p_entry),
-                                    "reason": "PYRAMID",
-                                    "mode": mode_rec,
-                                })
-                            except Exception:
-                                pass
-
-                # Exit rules (only if position is live and we haven't already sent an exit)
-                qty_live = int(active_contracts.get(cid, 0))
+                    current_qty = max(int(rec.get("qty", 0)), int(qty_live))
+                    if current_qty < MAX_CONTRACTS:
+                        next_level = (pyr_count + 1) * PYRAMID_STEP_ATR * atr_entry
+                        move_fav_now = (last_close - p_entry) if p_side == "LONG" else (p_entry - last_close)
+                        if move_fav_now >= next_level:
+                            add_qty_allowed = MAX_CONTRACTS - current_qty
+                            add_qty = min(int(PYRAMID_ADD_QTY), int(add_qty_allowed))
+                            if add_qty > 0:
+                                try:
+                                    add_side = "BUY" if p_side == "LONG" else "SELL"
+                                    resp_add = client.place_market_order(
+                                        account_id=account_id,
+                                        contract_id=cid,
+                                        side=add_side,
+                                        size=int(add_qty),
+                                        stop_ticks=None,
+                                        take_ticks=None,
+                                    )
+                                    rec["qty"] = current_qty + add_qty
+                                    rec["pyr_count"] = pyr_count + 1
+                                    print(f"{now_dt}: PYRAMID {add_side} {add_qty} {base} (contract {cid}) -> {resp_add}")
+                                    _log_trade("ADD", {
+                                        "ts": now_dt,
+                                        "account_id": account_id,
+                                        "symbol": base,
+                                        "contract_id": cid,
+                                        "side": p_side,
+                                        "qty": int(add_qty),
+                                        "entry_price": float(p_entry),
+                                        "reason": "PYRAMID",
+                                        "mode": mode_rec,
+                                    })
+                                    # refresh quantities for downstream calc
+                                    p_qty = rec.get("qty", current_qty + add_qty)
+                                    qty_live = max(qty_live, p_qty)
+                                except Exception:
+                                    pass
                 should_exit = False
                 if qty_live > 0 and not exit_sent:
                     # Time stop (adaptive: extend if progress >= 1x ATR)
