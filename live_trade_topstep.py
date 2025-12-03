@@ -53,42 +53,64 @@ def compute_entry_signal_mr(row, z_entry: float = 0.8) -> Optional[str]:
 def decide_trading_mode(
     row,
     mr_max_half_life: float,
-    adx_trend: float,
-    adx_mr: float,
-    bb_expand_mult: float,
-    bb_squeeze_mult: float,
+    adx_trend_min: float,
+    adx_mr_max: float,
+    bb_expand_ratio: float,
+    bb_compress_ratio: float,
     prev_mode: Optional[str] = None,
-) -> Optional[str]:
-    """Score-based decision between 'TREND' and 'MR' with hysteresis.
-    - TrendScore: +1 if hourly regime is UP/DOWN; +1 if ADX>=adx_trend; +1 if bb_bw_5 >= bb_expand_mult * bb_bw_ma_5
-    - MRScore: +1 if half-life<=mr_max_half_life; +1 if ADX<=adx_mr; +1 if bb_bw_5 <= bb_squeeze_mult * bb_bw_ma_5
-    - If scores tie, keep prev_mode; otherwise choose higher score.
+    trend_min_half_life: Optional[float] = None,
+) -> str:
+    """TREND/MR classifier with ADX-gated votes and simple hysteresis.
+    Decision:
+      if TrendScore>=1 and MRScore==0 -> TREND
+      elif MRScore>=2 and TrendScore==0 -> MR
+      else -> prev_mode or TREND
     """
-    regime = classify_regime(row)
-    adx = float(row.get("adx14") or np.nan)
-    bb_bw = float(row.get("bb_bw_5") or np.nan)
-    bb_bw_ma = float(row.get("bb_bw_ma_5") or np.nan)
-    hl = float(row.get("half_life") or np.nan)
+    try:
+        adx = float(row.get("adx_15m") or np.nan)
+    except Exception:
+        adx = np.nan
+    try:
+        bb_bw = float(row.get("bb_bw_5") or np.nan)
+        bb_ma = float(row.get("bb_bw_ma_5") or np.nan)
+    except Exception:
+        bb_bw = np.nan; bb_ma = np.nan
+    try:
+        hl = float(row.get("half_life") or np.nan)
+    except Exception:
+        hl = np.nan
 
-    trend_score = 0
-    mr_score = 0
-    if regime in ("UP", "DOWN"):
-        trend_score += 1
-    if not np.isnan(adx) and adx >= adx_trend:
-        trend_score += 1
-    if (not np.isnan(bb_bw)) and (not np.isnan(bb_bw_ma)) and bb_bw_ma != 0 and (bb_bw >= bb_expand_mult * bb_bw_ma):
-        trend_score += 1
+    TrendScore = 0
+    MRScore = 0
 
-    if (not np.isnan(hl)) and hl > 0 and hl <= mr_max_half_life:
-        mr_score += 1
-    if not np.isnan(adx) and adx <= adx_mr:
-        mr_score += 1
-    if (not np.isnan(bb_bw)) and (not np.isnan(bb_bw_ma)) and bb_bw_ma != 0 and (bb_bw <= bb_squeeze_mult * bb_bw_ma):
-        mr_score += 1
+    # ADX contribution
+    if not np.isnan(adx):
+        if adx >= float(adx_trend_min):
+            TrendScore += 1
+        elif adx <= float(adx_mr_max):
+            MRScore += 1
 
-    if trend_score > mr_score:
+    # Half-life contribution: MR only when ADX is low; TREND if long regardless
+    if not np.isnan(hl) and not np.isnan(adx):
+        if adx <= float(adx_mr_max) and hl <= float(mr_max_half_life):
+            MRScore += 1
+        elif hl >= float(trend_min_half_life or 0.0):
+            TrendScore += 1
+    elif not np.isnan(hl) and hl >= float(trend_min_half_life or 0.0):
+        TrendScore += 1
+
+    # Bollinger bandwidth: compression for MR only when ADX low; expansion for TREND when ADX moderate/high
+    if (not np.isnan(bb_bw)) and (not np.isnan(bb_ma)) and bb_ma != 0:
+        ratio = bb_bw / bb_ma
+        if ratio <= float(bb_compress_ratio) and (np.isnan(adx) or adx <= float(adx_mr_max)):
+            MRScore += 1
+        elif ratio >= float(bb_expand_ratio) and (np.isnan(adx) or adx >= float(adx_trend_min)):
+            TrendScore += 1
+
+    prev_mode = prev_mode or "TREND"
+    if TrendScore >= 1 and MRScore == 0:
         return "TREND"
-    if mr_score > trend_score:
+    if MRScore >= 2 and TrendScore == 0:
         return "MR"
     return prev_mode
 
@@ -242,10 +264,10 @@ def main():
         return raw.strip().lower() in ("1", "true", "yes", "on")
 
     ATR_STOP_MULT = _env_float("TOPSTEP_ATR_STOP_MULT", 1.25)
-    BE_TRIGGER_ATR = _env_float("TOPSTEP_BE_TRIGGER_ATR", 1.5)
-    BE_OFFSET_ATR = _env_float("TOPSTEP_BE_OFFSET_ATR", 0.10)
-    TRAIL1_TRIGGER_ATR = _env_float("TOPSTEP_TRAIL1_TRIGGER_ATR", 2.5)
-    TRAIL1_MULT = _env_float("TOPSTEP_TRAIL1_MULT", 2.0)
+    BE_TRIGGER_ATR = _env_float("TOPSTEP_BE_TRIGGER_ATR", 1.0)
+    BE_OFFSET_ATR = _env_float("TOPSTEP_BE_OFFSET_ATR", 0.25)
+    TRAIL1_TRIGGER_ATR = _env_float("TOPSTEP_TRAIL1_TRIGGER_ATR", 1.5)
+    TRAIL1_MULT = _env_float("TOPSTEP_TRAIL1_MULT", 1.0)
     TRAIL2_TRIGGER_ATR = _env_float("TOPSTEP_TRAIL2_TRIGGER_ATR", 4.0)
     TRAIL2_MULT = _env_float("TOPSTEP_TRAIL2_MULT", 1.5)
     TRAIL3_TRIGGER_ATR = _env_float("TOPSTEP_TRAIL3_TRIGGER_ATR", 5.0)
@@ -268,6 +290,10 @@ def main():
     PYRAMID_ADD_QTY = _env_int("TOPSTEP_PYRAMID_ADD_QTY", 1)
     TIME_STOP_MIN = _env_int("TOPSTEP_TIME_STOP_MIN", 90)
     ENFORCE_FORCE_FLAT = _env_bool("TOPSTEP_FORCE_FLAT", True)
+
+    # Global Dollar-ATR gating normalized to MYM behavior
+    DATR_MIN_GLOBAL = _env_float("TOPSTEP_GLOBAL_DATR_MIN", 5.0)
+    DATR_MAX_GLOBAL = _env_float("TOPSTEP_GLOBAL_DATR_MAX", 20.0)
 
     # PnL accounting and optional UI widget
     realized_pnl: float = 0.0
@@ -340,10 +366,11 @@ def main():
 
     # Main 1-minute polling loop (no entry session restriction)
     # Regime thresholds (env overrides)
-    adx_trend = float(os.environ.get("TOPSTEP_ADX_TREND", "25").strip() or 25)
-    adx_mr = float(os.environ.get("TOPSTEP_ADX_MR", "12").strip() or 12)
-    bb_expand_mult = float(os.environ.get("TOPSTEP_BB_EXPAND_MULT", "1.3").strip() or 1.3)
-    bb_squeeze_mult = float(os.environ.get("TOPSTEP_BB_SQUEEZE_MULT", "0.75").strip() or 0.75)
+    adx_trend_min = float(os.environ.get("TOPSTEP_ADX_TREND_MIN", "20").strip() or 20)
+    adx_mr_max = float(os.environ.get("TOPSTEP_ADX_MR_MAX", "15").strip() or 15)
+    bb_expand_ratio = float(os.environ.get("TOPSTEP_BB_EXPAND_RATIO", "1.2").strip() or 1.2)
+    bb_compress_ratio = float(os.environ.get("TOPSTEP_BB_COMPRESS_RATIO", "0.8").strip() or 0.8)
+    trend_min_half_life = float(os.environ.get("TOPSTEP_TREND_MIN_HALF_LIFE", "120").strip() or 120)
 
     # Keep previous mode per symbol to reduce flapping
     prev_mode_by_symbol: Dict[str, Optional[str]] = {}
@@ -394,7 +421,7 @@ def main():
                 except Exception:
                     pass
 
-                # In-position guard via open positions (per contract)
+                # In-position guard via open positions (per contract) and capture live qty
                 try:
                     open_pos = client.search_open_positions(account_id=account_id)
                 except Exception as e:
@@ -402,6 +429,7 @@ def main():
                     open_pos = []
 
                 in_market = False
+                live_qty_here = 0
                 try:
                     # Normalize to iterable
                     if isinstance(open_pos, dict):
@@ -413,10 +441,13 @@ def main():
                         qty = p.get("quantity") or p.get("qty") or p.get("netPosition") or 0
                         if cid and cid == str(contract_id):
                             try:
-                                if int(qty) != 0:
-                                    in_market = True
-                                    break
+                                live_qty_here = int(qty)
                             except Exception:
+                                try:
+                                    live_qty_here = int(float(qty))
+                                except Exception:
+                                    live_qty_here = 0
+                            if live_qty_here != 0:
                                 in_market = True
                                 break
                 except Exception:
@@ -440,22 +471,37 @@ def main():
                 except Exception:
                     hh = datetime.now().hour
                     mm = datetime.now().minute
-                adx_trend_local = adx_trend
+                adx_trend_local = adx_trend_min
                 if (hh > 8 or (hh == 8 and mm >= 30)) and (hh < 11 or (hh == 11 and mm == 0)):
                     adx_trend_local = max(adx_trend_local, 30.0)
-                mode = decide_trading_mode(
+                regime_mode = decide_trading_mode(
                     row,
                     mr_max_half_life=mr_hl,
-                    adx_trend=adx_trend_local,
-                    adx_mr=adx_mr,
-                    bb_expand_mult=bb_expand_mult,
-                    bb_squeeze_mult=bb_squeeze_mult,
+                    adx_trend_min=adx_trend_local,
+                    adx_mr_max=adx_mr_max,
+                    bb_expand_ratio=bb_expand_ratio,
+                    bb_compress_ratio=bb_compress_ratio,
                     prev_mode=prev_mode,
+                    trend_min_half_life=trend_min_half_life,
                 )
-                # Disable MR trades: ignore MR mode
+                # Log regime mode change
+                if regime_mode != prev_mode:
+                    try:
+                        bb_bw = float(row.get("bb_bw_5") or np.nan)
+                        bb_ma = float(row.get("bb_bw_ma_5") or np.nan)
+                        ratio = (bb_bw / bb_ma) if (not np.isnan(bb_bw) and not np.isnan(bb_ma) and bb_ma != 0) else float('nan')
+                    except Exception:
+                        ratio = float('nan')
+                    try:
+                        print(f"[{base}] mode change: {prev_mode or 'TREND'} -> {regime_mode}, half_life={float(row.get('half_life') or np.nan):.1f}, adx_15m={float(row.get('adx_15m') or np.nan):.1f}, bb_ratio={(ratio if not np.isnan(ratio) else float('nan')):.2f}")
+                    except Exception:
+                        pass
+                prev_mode_by_symbol[base] = regime_mode
+
+                # Disable MR trades: ignore MR for new entries
+                mode = regime_mode
                 if mode == "MR":
                     mode = None
-                prev_mode_by_symbol[base] = mode
 
                 z_entry_env = os.environ.get("TOPSTEP_MR_Z_ENTRY", "1.0").strip()
                 try:
@@ -465,8 +511,6 @@ def main():
                 # Midday uplift 12:00-14:00
                 if (hh > 12 or (hh == 12 and mm >= 0)) and (hh < 14 or (hh == 14 and mm == 0)):
                     z_entry = max(z_entry, 1.2)
-
-                # ATR/$ATR entry gating disabled per request (kept ATR must be > 0 check below)
 
                 side = None
                 if mode == "TREND":
@@ -485,6 +529,34 @@ def main():
                 if atr_here <= 0:
                     print(f"{ts}: no valid ATR for {base}; skip.")
                     continue
+                # Per-symbol ATR band (MNQ points; others $ATR) + overextension + pullback
+                def _atr_in_band(sym: str, atr_points: float) -> bool:
+                    try:
+                        ap = float(atr_points)
+                    except Exception:
+                        return False
+                    if "MNQ" in sym.upper():
+                        try:
+                            mnq_min = float(os.environ.get("MNQ_ATR_MIN", "5.0").strip())
+                            mnq_max = float(os.environ.get("MNQ_ATR_MAX", "14.0").strip())
+                        except Exception:
+                            mnq_min, mnq_max = 5.0, 14.0
+                        return mnq_min <= ap <= mnq_max
+                    datr_local = ap * point_value_for(sym)
+                    gmin = float(os.environ.get("TOPSTEP_GLOBAL_DATR_MIN", "5").strip() or 5)
+                    gmax = float(os.environ.get("TOPSTEP_GLOBAL_DATR_MAX", "20").strip() or 20)
+                    return gmin <= datr_local <= gmax
+                if not _atr_in_band(base, atr_here):
+                    print(f"{ts}: ATR band block for {base} (atr={atr_here:.2f}).")
+                    continue
+                try:
+                    ema1h = float(row.get("ema_1h_50") or 0.0)
+                except Exception:
+                    ema1h = 0.0
+                ov_mult = float(os.environ.get("OVEREXT_ATR_MULT", "2.0").strip() or 2.0)
+                if ema1h and atr_here and abs(float(row.get("Close")) - ema1h) > ov_mult * atr_here:
+                    print(f"{ts}: overextended vs 1h EMA for {base}; skip.")
+                    continue
                 stop_points = 2.0 * atr_here
                 pv = point_value_for(base)
                 risk_per_contract = stop_points * pv
@@ -494,11 +566,57 @@ def main():
                 qty = int(RISK_PER_TRADE / risk_per_contract)
                 qty = max(qty, int(MIN_QTY))
                 qty = min(qty, int(MAX_CONTRACTS))
+                # Respect live cap: do not exceed MAX_CONTRACTS including any existing live qty
+                try:
+                    local_qty = int(open_positions_local.get(contract_id, {}).get("qty", 0))
+                except Exception:
+                    local_qty = 0
+                current_total = max(live_qty_here, local_qty)
+                remaining = int(MAX_CONTRACTS) - int(current_total)
+                if remaining <= 0:
+                    print(f"{ts}: size cap reached on {base} (live {live_qty_here}, local {local_qty}); skip new entry.")
+                    continue
+                if qty > remaining:
+                    print(f"{ts}: capping entry size for {base} from {qty} to {remaining} to respect max {int(MAX_CONTRACTS)}.")
+                    qty = remaining
                 if not qty:
                     print(f"{ts}: no valid qty for {base}; skip.")
                     continue
 
                 try:
+                    # Optional micro-pullback filter before breakout
+                    def _micro_pullback_ok(df_loc, ts_loc, direction: str) -> bool:
+                        req = (os.environ.get("REQ_MICRO_PULLBACK", "1").strip().lower() not in ("0","false"))
+                        if not req:
+                            return True
+                        try:
+                            lookback = int(float(os.environ.get("PULLBACK_LOOKBACK", "5").strip()))
+                        except Exception:
+                            lookback = 5
+                        try:
+                            min_pts = float(os.environ.get("PULLBACK_MIN_POINTS", "3.0").strip())
+                        except Exception:
+                            min_pts = 3.0
+                        try:
+                            if ts_loc not in df_loc.index:
+                                return True
+                            hist = df_loc.loc[:ts_loc].iloc[:-1].tail(lookback)
+                            if hist.empty:
+                                return False
+                            cc = float(df_loc.loc[ts_loc, "Close"])
+                            if direction == "LONG":
+                                return (cc - hist["Close"]).max() >= min_pts
+                            else:
+                                return (hist["Close"] - cc).max() >= min_pts
+                        except Exception:
+                            return True
+                    if side == "LONG" and not _micro_pullback_ok(df, ts, "LONG"):
+                        print(f"{ts}: pullback filter blocked LONG {base}.")
+                        continue
+                    if side == "SHORT" and not _micro_pullback_ok(df, ts, "SHORT"):
+                        print(f"{ts}: pullback filter blocked SHORT {base}.")
+                        continue
+
                     # Compute initial stop for logging based on ATR and configured multiple
                     atr_here = float(row.get("atr") or 0.0)
                     entry_px = float(row["Close"]) if "Close" in row else None
@@ -506,6 +624,31 @@ def main():
                     if atr_here and entry_px:
                         stop_dist = ATR_STOP_MULT * atr_here
                         init_stop = entry_px - stop_dist if side == "LONG" else entry_px + stop_dist
+                    # Build entry rationale string
+                    try:
+                        donch_high = float(row.get("donch_high") or float('nan'))
+                        donch_low = float(row.get("donch_low") or float('nan'))
+                    except Exception:
+                        donch_high = float('nan'); donch_low = float('nan')
+                    try:
+                        regime = classify_regime(row)
+                    except Exception:
+                        regime = "?"
+                    try:
+                        adx_now = float(last_ind.get(base, {}).get("adx14", float('nan')))
+                        adx_prev = float(last_ind.get(base, {}).get("adx14_prev", float('nan')))
+                    except Exception:
+                        adx_now = float('nan'); adx_prev = float('nan')
+                    pv = point_value_for(base)
+                    stop_points = 2.0 * atr_here if atr_here else 0.0
+                    risk_per_contract = stop_points * pv if stop_points else 0.0
+                    rationale = (
+                        f"trend breakout: regime {regime}, "
+                        f"close {entry_px:.2f}"
+                        + (f" > DonchianHigh {donch_high:.2f}" if side == 'LONG' and donch_high == donch_high else (f" < DonchianLow {donch_low:.2f}" if side == 'SHORT' and donch_low == donch_low else ""))
+                        + f"; mode {mode}; ADX {adx_now:.1f} (prev {adx_prev:.1f}) vs thr {adx_trend_local:.1f}; "
+                        + f"ATR {atr_here:.2f}, stop {stop_points:.2f} pts, risk/ct ${risk_per_contract:.0f}, qty {qty}"
+                    )
                     resp = client.place_market_order(
                         account_id=account_id,
                         contract_id=contract_id,
@@ -543,6 +686,10 @@ def main():
                                         "init_stop": float(init_stop) if init_stop is not None else None,
                                         "mfe_price": float(row["Close"]),
                                         "exit_sent": False,
+                                        # No fixed TP when brackets rejected; dynamic trailing
+                                        "tp_price": None,
+                                        "tp_ticks": None,
+                                        "tp_spec": "dynamic trail",
                                     }
                             except Exception as e2:
                                 print(f"{ts}: retry without brackets failed: {e2}")
@@ -583,6 +730,10 @@ def main():
                         elif tp_spec is not None:
                             base_msg += f" | tp {tp_spec}"
                         base_msg += f" | mode {mode} (acct {account_id}, contract {contract_id}) -> {resp}"
+                        try:
+                            base_msg += f"\n  reason: {rationale}"
+                        except Exception:
+                            pass
                         print(base_msg)
                         # Track local position on assumed fill
                         if contract_id not in open_positions_local:
@@ -596,6 +747,10 @@ def main():
                                 "init_stop": float(init_stop) if init_stop is not None else None,
                                 "mfe_price": float(row["Close"]),
                                 "exit_sent": False,
+                                # Persist TP info for monitoring
+                                "tp_price": float(tp_price) if tp_price is not None else None,
+                                "tp_ticks": int(tp_ticks) if tp_ticks is not None else None,
+                                "tp_spec": tp_spec,
                             }
                         # Log entry
                         _log_trade(
@@ -958,6 +1113,7 @@ def main():
 
                     # Price-based stops using entry ATR
                     if not should_exit and atr_entry > 0:
+                        eff_stop_local = None
                         # initial stop
                         if p_side == "LONG":
                             new_stop = p_entry - ATR_STOP_MULT * atr_entry
@@ -991,6 +1147,7 @@ def main():
                             eff_stop = stop_price
                             if eff_stop is not None:
                                 eff_stop = eff_stop - STOP_TICK_BUFFER * tick_size_for(base)
+                            eff_stop_local = eff_stop
                             # Confirmation counter
                             if STOP_CLOSE_ONLY and eff_stop is not None:
                                 c = int(rec.get("stop_breach", 0))
@@ -1001,6 +1158,23 @@ def main():
                                 else:
                                     c = 0
                                 rec["stop_breach"] = c
+                            # Winner-protection safety (LONG)
+                            try:
+                                safe_pts = float(os.environ.get("SAFE_MFE_POINTS", "6.0").strip())
+                            except Exception:
+                                safe_pts = 6.0
+                            try:
+                                safe_off = float(os.environ.get("SAFE_BE_OFFSET_POINTS", "0.5").strip())
+                            except Exception:
+                                safe_off = 0.5
+                            try:
+                                mfe_pts_now = mfe_price - p_entry
+                            except Exception:
+                                mfe_pts_now = 0.0
+                            if safe_pts and mfe_pts_now >= safe_pts:
+                                safe_stop = p_entry + safe_off
+                                if (stop_price is None) or (safe_stop > stop_price):
+                                    stop_price = safe_stop
                             elif stop_price is not None and last_close <= stop_price:
                                 should_exit = True
                         else:  # SHORT
@@ -1031,6 +1205,7 @@ def main():
                             eff_stop = stop_price
                             if eff_stop is not None:
                                 eff_stop = eff_stop + STOP_TICK_BUFFER * tick_size_for(base)
+                            eff_stop_local = eff_stop
                             if STOP_CLOSE_ONLY and eff_stop is not None:
                                 c = int(rec.get("stop_breach", 0))
                                 if last_close >= eff_stop:
@@ -1040,8 +1215,95 @@ def main():
                                 else:
                                     c = 0
                                 rec["stop_breach"] = c
+                            # Winner-protection safety (SHORT)
+                            try:
+                                safe_pts = float(os.environ.get("SAFE_MFE_POINTS", "6.0").strip())
+                            except Exception:
+                                safe_pts = 6.0
+                            try:
+                                safe_off = float(os.environ.get("SAFE_BE_OFFSET_POINTS", "0.5").strip())
+                            except Exception:
+                                safe_off = 0.5
+                            try:
+                                mfe_pts_now = p_entry - mfe_price
+                            except Exception:
+                                mfe_pts_now = 0.0
+                            if safe_pts and mfe_pts_now >= safe_pts:
+                                safe_stop = p_entry - safe_off
+                                if (stop_price is None) or (safe_stop < stop_price):
+                                    stop_price = safe_stop
                             elif stop_price is not None and last_close >= stop_price:
                                 should_exit = True
+
+                # Per-loop status report: confirm stay/exit rationale
+                try:
+                    adx_now = float(last_ind.get(base, {}).get("adx14", float('nan')))
+                    adx_prev = float(last_ind.get(base, {}).get("adx14_prev", float('nan')))
+                except Exception:
+                    adx_now = float('nan'); adx_prev = float('nan')
+                if qty_live > 0 and not exit_sent:
+                    # compute move_fav in points and ATRs
+                    try:
+                        move_pts = (last_close - p_entry) if p_side == "LONG" else (p_entry - last_close)
+                    except Exception:
+                        move_pts = 0.0
+                    move_atr = (move_pts / atr_entry) if atr_entry else float('nan')
+                    # Compute current TP label and detect change
+                    tp_label = "dynamic"
+                    try:
+                        if rec.get("tp_price") is not None:
+                            tp_label = f"{float(rec.get('tp_price')):.2f}"
+                        else:
+                            # Dynamic plan: show next partial target when applicable
+                            next_tp = None
+                            if mode_rec == "TREND" and atr_entry > 0:
+                                partial1_mult = 1.5
+                                try:
+                                    partial2_mult = float(os.environ.get("TOPSTEP_TREND_PARTIAL2_ATR", "3.0").strip())
+                                except Exception:
+                                    partial2_mult = 3.0
+                                if not bool(rec.get("trend_partial_done", False)):
+                                    next_tp = (p_entry + partial1_mult * atr_entry) if p_side == "LONG" else (p_entry - partial1_mult * atr_entry)
+                                elif not bool(rec.get("trend_partial2_done", False)):
+                                    next_tp = (p_entry + partial2_mult * atr_entry) if p_side == "LONG" else (p_entry - partial2_mult * atr_entry)
+                            if next_tp is not None:
+                                tp_label = f"next partial {next_tp:.2f}"
+                            else:
+                                # No hard TP; runner with trailing stops
+                                tp_label = rec.get("tp_spec") or "dynamic"
+                    except Exception:
+                        tp_label = rec.get("tp_spec") or "dynamic"
+                    tp_changed = False
+                    try:
+                        last_tp = rec.get("last_tp_label")
+                        tp_changed = (str(last_tp) != str(tp_label))
+                        rec["last_tp_label"] = tp_label
+                    except Exception:
+                        pass
+                    # reason flags
+                    reasons = []
+                    if not should_exit:
+                        reasons.append("stop intact")
+                        if not past_force_flat(now_dt):
+                            reasons.append("outside force-flat")
+                        else:
+                            reasons.append("force-flat window")
+                        try:
+                            reasons.append(f"time {int(minutes_in_trade)}m<{int(eff_time_stop)}m")
+                        except Exception:
+                            pass
+                        if not (adx_now != adx_now or adx_prev != adx_prev):
+                            slope = "↑" if adx_now > adx_prev else ("↓" if adx_now < adx_prev else "=")
+                            reasons.append(f"ADX {adx_now:.1f} {slope}")
+                    else:
+                        reasons.append("exit condition met")
+                    stop_txt = "n/a"
+                    try:
+                        if 'eff_stop_local' in locals() and eff_stop_local is not None:
+                            stop_txt = f"{eff_stop_local:.2f}"
+                    except Exception:
+                        pass
+                    print(f"{now_dt}: HOLD {p_side} {qty_live} {base} @ {last_close:.2f} | stop {stop_txt} | tp {tp_label}{' (changed)' if tp_changed else ''} | +{move_pts:.2f} pts ({move_atr:.2f} ATR) | {'; '.join(reasons)}")
 
                 # Send exit order if needed
                 if qty_live > 0 and should_exit and not exit_sent:

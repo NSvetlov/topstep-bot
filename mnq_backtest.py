@@ -104,7 +104,7 @@ PYRAMID_ADD_QTY = 1
 STARTING_CAPITAL = 100_000.0
 
 # Donchian settings (15m trend-following entries)
-DONCHIAN_LEN = 20
+DONCHIAN_LEN = 10
 
 # Per-ticker point values (for $ATR filtering)
 PNT_VALUE = {
@@ -116,6 +116,100 @@ PNT_VALUE = {
 
 def point_value_for(symbol: str) -> float:
     return float(PNT_VALUE.get(symbol.upper(), MULTIPLIER))
+
+# Per-ticker tick sizes for stop buffer parity with live
+TICK_SIZE_MAP = {
+    "MNQ": 0.25,
+    "MES": 0.25,
+    "MYM": 1.0,
+    "M2K": 0.1,
+}
+
+def tick_size_for(symbol: str) -> float:
+    return float(TICK_SIZE_MAP.get(symbol.upper(), 0.25))
+
+def is_mnq_symbol(symbol: Optional[str]) -> bool:
+    if not symbol:
+        return False
+    return "MNQ" in str(symbol).upper()
+
+def atr_in_band_for_symbol(symbol: str, atr_points: float) -> bool:
+    try:
+        atr_points = float(atr_points)
+    except Exception:
+        return False
+    if is_mnq_symbol(symbol):
+        return (atr_points >= MNQ_ATR_MIN) and (atr_points <= MNQ_ATR_MAX)
+    # Non-MNQ: fall back to global $ATR band
+    pv = point_value_for(symbol)
+    datr = atr_points * pv
+    return (datr >= DATR_MIN_GLOBAL) and (datr <= DATR_MAX_GLOBAL)
+
+def is_overextended(row) -> bool:
+    """Apply overextension filter only when trend is sufficiently strong (15m ADX high)."""
+    try:
+        adx15 = float(row.get("adx_15m") or np.nan)
+    except Exception:
+        adx15 = np.nan
+    # Only block when ADX is strong enough to consider extension meaningful
+    try:
+        adx_thr = ADX_TREND_MIN
+    except Exception:
+        adx_thr = 20.0
+    if np.isnan(adx15) or adx15 < adx_thr:
+        return False
+    try:
+        close = float(row.get("Close") if "Close" in row else row.get("close"))
+        ema_1h = row.get("ema_1h_50") if "ema_1h_50" in row else row.get("ema_1h")
+        atr = float(row.get("atr") or row.get("atr14") or 0.0)
+        if ema_1h is None or atr <= 0:
+            return False
+        ema_1h = float(ema_1h)
+        return abs(close - ema_1h) > OVEREXT_ATR_MULT * atr
+    except Exception:
+        return False
+
+def micro_pullback_ok(df: pd.DataFrame, ts: pd.Timestamp, direction: str) -> bool:
+    if not REQ_MICRO_PULLBACK:
+        return True
+    if ts not in df.index:
+        return True
+    hist = df.loc[:ts].iloc[:-1].tail(PULLBACK_LOOKBACK)
+    if hist.empty:
+        return False
+    try:
+        current_close = float(df.loc[ts, "Close"])
+    except Exception:
+        return True
+    if direction == "LONG":
+        return (current_close - hist["Close"]).max() >= PULLBACK_MIN_POINTS
+    if direction == "SHORT":
+        return (hist["Close"] - current_close).max() >= PULLBACK_MIN_POINTS
+    return True
+
+
+def atr_in_mr_band(atr_val: float) -> bool:
+    try:
+        v = float(atr_val)
+    except Exception:
+        return False
+    return (v >= MR_ATR_MIN) and (v <= MR_ATR_MAX)
+
+
+def get_mr_z(row) -> Optional[float]:
+    try:
+        if MR_Z_COL in row:
+            return float(row.get(MR_Z_COL))
+    except Exception:
+        pass
+    # common fallbacks
+    for alt in ("Z", "zscore_dev", "z_dev", "dev_z"):
+        try:
+            if alt in row:
+                return float(row.get(alt))
+        except Exception:
+            continue
+    return None
 
 def _parse_band_map(raw: str):
     m = {}
@@ -154,6 +248,178 @@ BASE_SYMBOL = (TICKER.split("=")[0] if "=" in TICKER else TICKER).strip().upper(
 # Disable ATR/$ATR entry gating for backtest (still requires ATR > 0)
 ATR_FILTER_ENABLED = False
 
+# Stop tightening hysteresis (in ATRs), close-confirmation count, and tick buffer (ticks)
+MIN_STOP_STEP_ATR = 0.25
+STOP_CLOSE_CONFIRMED = 1
+STOP_TICK_BUFFER = 2.0
+
+# Global Dollar-ATR entry band (normalized to MYM behavior)
+try:
+    DATR_MIN_GLOBAL = float(os.environ.get("TOPSTEP_GLOBAL_DATR_MIN", "5").strip())
+except Exception:
+    DATR_MIN_GLOBAL = 5.0
+try:
+    DATR_MAX_GLOBAL = float(os.environ.get("TOPSTEP_GLOBAL_DATR_MAX", "20").strip())
+except Exception:
+    DATR_MAX_GLOBAL = 20.0
+
+# Regime classifier thresholds (env-based)
+try:
+    HL_MR_MAX = float(os.environ.get("HL_MR_MAX", "5.0").strip())
+except Exception:
+    HL_MR_MAX = 5.0
+try:
+    HL_TREND_MIN = float(os.environ.get("HL_TREND_MIN", "30.0").strip())
+except Exception:
+    HL_TREND_MIN = 30.0
+try:
+    ADX_MR_MAX = float(os.environ.get("ADX_MR_MAX", "15.0").strip())
+except Exception:
+    ADX_MR_MAX = 15.0
+try:
+    ADX_TREND_MIN = float(os.environ.get("ADX_TREND_MIN", "20.0").strip())
+except Exception:
+    ADX_TREND_MIN = 20.0
+try:
+    BB_COMPRESS_RATIO = float(os.environ.get("BB_COMPRESS_RATIO", "0.8").strip())
+except Exception:
+    BB_COMPRESS_RATIO = 0.8
+try:
+    BB_EXPAND_RATIO = float(os.environ.get("BB_EXPAND_RATIO", "1.2").strip())
+except Exception:
+    BB_EXPAND_RATIO = 1.2
+
+# Compatibility: allow alternate env names to override the same thresholds
+def _override_from_alt_env():
+    global ADX_TREND_MIN, ADX_MR_MAX, BB_EXPAND_RATIO, BB_COMPRESS_RATIO, HL_MR_MAX
+    try:
+        v = os.environ.get("ADX_TREND")
+        if v:
+            ADX_TREND_MIN = float(v)
+    except Exception:
+        pass
+    try:
+        v = os.environ.get("ADX_MR")
+        if v:
+            ADX_MR_MAX = float(v)
+    except Exception:
+        pass
+    try:
+        v = os.environ.get("BB_EXPAND_MULT")
+        if v:
+            BB_EXPAND_RATIO = float(v)
+    except Exception:
+        pass
+    try:
+        v = os.environ.get("BB_SQUEEZE_MULT")
+        if v:
+            BB_COMPRESS_RATIO = float(v)
+    except Exception:
+        pass
+    try:
+        v = os.environ.get("MR_MAX_HALF_LIFE")
+        if v:
+            HL_MR_MAX = float(v)
+    except Exception:
+        pass
+
+_override_from_alt_env()
+
+# Winner protection safety rule
+try:
+    SAFE_MFE_POINTS = float(os.environ.get("SAFE_MFE_POINTS", "6.0").strip())
+except Exception:
+    SAFE_MFE_POINTS = 6.0
+try:
+    SAFE_BE_OFFSET_POINTS = float(os.environ.get("SAFE_BE_OFFSET_POINTS", "0.5").strip())
+except Exception:
+    SAFE_BE_OFFSET_POINTS = 0.5
+
+# MNQ-specific ATR band (points)
+try:
+    MNQ_ATR_MIN = float(os.environ.get("MNQ_ATR_MIN", "2.0").strip())
+except Exception:
+    MNQ_ATR_MIN = 2.0
+try:
+    MNQ_ATR_MAX = float(os.environ.get("MNQ_ATR_MAX", "20.0").strip())
+except Exception:
+    MNQ_ATR_MAX = 20.0
+
+# Overextension filter threshold vs 1h EMA
+try:
+    OVEREXT_ATR_MULT = float(os.environ.get("OVEREXT_ATR_MULT", "3.0").strip())
+except Exception:
+    OVEREXT_ATR_MULT = 3.0
+
+# MNQ-tuned BE/Trail defaults (overrides earlier literals)
+try:
+    BE_TRIGGER_ATR = float(os.environ.get("BE_TRIGGER_ATR", "1.0").strip())
+except Exception:
+    BE_TRIGGER_ATR = 1.0
+try:
+    BE_OFFSET_ATR = float(os.environ.get("BE_OFFSET_ATR", "0.25").strip())
+except Exception:
+    BE_OFFSET_ATR = 0.25
+try:
+    TRAIL1_TRIGGER_ATR = float(os.environ.get("TRAIL1_TRIGGER_ATR", "1.5").strip())
+except Exception:
+    TRAIL1_TRIGGER_ATR = 1.5
+try:
+    TRAIL1_MULT = float(os.environ.get("TRAIL1_MULT", "1.0").strip())
+except Exception:
+    TRAIL1_MULT = 1.0
+
+# Optional micro-pullback before breakout entries
+REQ_MICRO_PULLBACK = (os.environ.get("REQ_MICRO_PULLBACK", "0").strip().lower() not in ("0", "false"))
+try:
+    PULLBACK_LOOKBACK = int(float(os.environ.get("PULLBACK_LOOKBACK", "5").strip()))
+except Exception:
+    PULLBACK_LOOKBACK = 5
+try:
+    PULLBACK_MIN_POINTS = float(os.environ.get("PULLBACK_MIN_POINTS", "3.0").strip())
+except Exception:
+    PULLBACK_MIN_POINTS = 3.0
+
+# Mean-reversion (MR) strategy knobs
+MR_ENABLE = (os.environ.get("MR_ENABLE", "1").strip().lower() not in ("0", "false"))
+MR_Z_COL = os.environ.get("MR_Z_COL", "mr_z").strip() or "mr_z"
+try:
+    MR_Z_ENTRY = float(os.environ.get("MR_Z_ENTRY", "0.9").strip())
+except Exception:
+    MR_Z_ENTRY = 0.9
+try:
+    MR_Z_TP_ZONE = float(os.environ.get("MR_Z_TP_ZONE", "0.35").strip())
+except Exception:
+    MR_Z_TP_ZONE = 0.35
+try:
+    MR_Z_MAX_EXTREME = float(os.environ.get("MR_Z_MAX_EXTREME", "3.0").strip())
+except Exception:
+    MR_Z_MAX_EXTREME = 3.0
+try:
+    MR_ATR_STOP_MULT = float(os.environ.get("MR_ATR_STOP_MULT", "1.0").strip())
+except Exception:
+    MR_ATR_STOP_MULT = 1.0
+try:
+    MR_BE_TRIGGER_ATR = float(os.environ.get("MR_BE_TRIGGER_ATR", "0.75").strip())
+except Exception:
+    MR_BE_TRIGGER_ATR = 0.75
+try:
+    MR_BE_OFFSET_ATR = float(os.environ.get("MR_BE_OFFSET_ATR", "0.10").strip())
+except Exception:
+    MR_BE_OFFSET_ATR = 0.10
+try:
+    MR_Z_EXIT = float(os.environ.get("MR_Z_EXIT", "0.2").strip())
+except Exception:
+    MR_Z_EXIT = 0.2
+try:
+    MR_ATR_MIN = float(os.environ.get("MR_ATR_MIN", "3.0").strip())
+except Exception:
+    MR_ATR_MIN = 3.0
+try:
+    MR_ATR_MAX = float(os.environ.get("MR_ATR_MAX", "16.0").strip())
+except Exception:
+    MR_ATR_MAX = 16.0
+
 
 @dataclass
 class Trade:
@@ -176,6 +442,9 @@ class Trade:
     mfe_price_at_exit: Optional[float] = None
     entry_qty: Optional[int] = None         # size at entry
     max_qty: Optional[int] = None           # max size reached (with pyramiding)
+    # Strategy annotations
+    strategy: Optional[str] = None          # 'TREND' or 'MR'
+    entry_reason: Optional[str] = None      # e.g., 'BREAKOUT' or 'MR_Z_REVERSION'
 
 
 # =========================
@@ -294,6 +563,30 @@ def load_mnq_data(interval: Optional[str] = None, period: Optional[str] = None, 
     df["adx14_5"] = df5["adx14_5"].reindex(df.index, method="ffill")
     df["bb_bw_5"] = df5["bb_bw_5"].reindex(df.index, method="ffill")
     df["bb_bw_ma_5"] = df5["bb_bw_ma_5"].reindex(df.index, method="ffill")
+
+    # Build 15-minute ADX for regime classification
+    ohlc_15 = {
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }
+    df15 = df[["Open", "High", "Low", "Close", "Volume"]].resample("15min").agg(ohlc_15).dropna()
+    tr1_15 = df15["High"] - df15["Low"]
+    tr2_15 = (df15["High"] - df15["Close"].shift(1)).abs()
+    tr3_15 = (df15["Low"] - df15["Close"].shift(1)).abs()
+    tr_15 = pd.concat([tr1_15, tr2_15, tr3_15], axis=1).max(axis=1)
+    plus_dm_15 = np.maximum(df15["High"] - df15["High"].shift(1), 0)
+    minus_dm_15 = np.maximum(df15["Low"].shift(1) - df15["Low"], 0)
+    tr14_15 = tr_15.rolling(14).sum()
+    plus14_15 = plus_dm_15.rolling(14).sum()
+    minus14_15 = minus_dm_15.rolling(14).sum()
+    plus_di_15 = 100 * plus14_15 / tr14_15
+    minus_di_15 = 100 * minus14_15 / tr14_15
+    dx_15 = 100 * (plus_di_15 - minus_di_15).abs() / (plus_di_15 + minus_di_15)
+    df15["adx_15m"] = dx_15.rolling(14).mean()
+    df["adx_15m"] = df15["adx_15m"].reindex(df.index, method="ffill")
 
     # Legacy 1m breakout levels (not used for entry any more)
     N_BREAK = 20
@@ -474,59 +767,88 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
     # Debug counters for entry gating diagnostics
     stats = {
         "bars": 0,
+        "trend_bars": 0,
+        "mr_bars": 0,
         "long_signal": 0,
         "short_signal": 0,
+        "skipped_atr": 0,
+        "skipped_overext": 0,
+        "skipped_pullback": 0,
+        "skipped_no_breakout": 0,
+        "skipped_mr_z": 0,
     }
 
-    # Cooldown after stop per direction (optional; kept)
+    # Cooldowns per direction
     last_stop_i_long = -10**9
     last_stop_i_short = -10**9
-    COOLDOWN_BARS = 0  # cooldown disabled to mirror live behavior
+    last_entry_i_long = -10**9
+    last_entry_i_short = -10**9
+    COOLDOWN_BARS = 3
 
     # Mode hysteresis
     last_mode: Optional[str] = None  # 'TREND', 'MR', or None
 
-    # Thresholds for regime scoring
-    ADX_TREND = 25.0
-    ADX_MR = 12.0
-    BB_EXPAND_MULT = 1.3
-    BB_SQUEEZE_MULT = 0.75
-    MR_MAX_HALF_LIFE = 45.0  # minutes on base TF
+    def decide_trading_mode(row, prev_mode: Optional[str] = None) -> str:
+        """TREND/MR classifier with ADX-gated votes and hysteresis.
+        - MR votes: ADX low; and/or (HL very short while ADX low); and/or (BB compressed while ADX low)
+        - TREND votes: ADX high; or HL long; or BB expanding while ADX moderate/high
+        Decision:
+          if TrendScore>=1 and MRScore==0 -> TREND
+          elif MRScore>=2 and TrendScore==0 -> MR
+          else -> prev_mode or TREND
+        """
+        hl = row.get("half_life")
+        adx = row.get("adx_15m")
+        bb_bw = row.get("bb_bw_5")
+        bb_bw_ma = row.get("bb_bw_ma_5")
 
-    def decide_mode(row) -> Optional[str]:
-        nonlocal last_mode
-        # Inputs
-        regime = classify_regime(row)
-        adx = float(row.get("adx14") or np.nan)
-        bb_bw = float(row.get("bb_bw_5") or np.nan)
-        bb_bw_ma = float(row.get("bb_bw_ma_5") or np.nan)
-        hl = float(row.get("half_life") or np.nan)
+        try:
+            hl = float(hl) if hl is not None else np.nan
+        except Exception:
+            hl = np.nan
+        try:
+            adx = float(adx) if adx is not None else np.nan
+        except Exception:
+            adx = np.nan
+        try:
+            bb_bw = float(bb_bw) if bb_bw is not None else np.nan
+            bb_bw_ma = float(bb_bw_ma) if bb_bw_ma is not None else np.nan
+        except Exception:
+            bb_bw = np.nan; bb_bw_ma = np.nan
 
-        trend_score = 0
-        mr_score = 0
-        if regime in ("UP", "DOWN"):
-            trend_score += 1
-        if not np.isnan(adx) and adx >= ADX_TREND:
-            trend_score += 1
-        if (not np.isnan(bb_bw)) and (not np.isnan(bb_bw_ma)) and bb_bw_ma != 0 and (bb_bw >= BB_EXPAND_MULT * bb_bw_ma):
-            trend_score += 1
+        TrendScore = 0
+        MRScore = 0
 
-        if (not np.isnan(hl)) and hl > 0 and hl <= MR_MAX_HALF_LIFE:
-            mr_score += 1
-        if not np.isnan(adx) and adx <= ADX_MR:
-            mr_score += 1
-        if (not np.isnan(bb_bw)) and (not np.isnan(bb_bw_ma)) and bb_bw_ma != 0 and (bb_bw <= BB_SQUEEZE_MULT * bb_bw_ma):
-            mr_score += 1
+        # ADX contribution
+        if not np.isnan(adx):
+            if adx >= ADX_TREND_MIN:
+                TrendScore += 1
+            elif adx <= ADX_MR_MAX:
+                MRScore += 1
 
-        mode: Optional[str]
-        if trend_score - mr_score >= 1:
-            mode = "TREND"
-        elif mr_score - trend_score >= 1:
-            mode = None  # MR disabled
-        else:
-            mode = last_mode  # hysteresis: keep prior mode if indecisive
-        last_mode = mode
-        return mode
+        # Half-life contribution (MR only when ADX low; TREND if long HL regardless)
+        if not np.isnan(hl) and not np.isnan(adx):
+            if adx <= ADX_MR_MAX and hl <= HL_MR_MAX:
+                MRScore += 1
+            elif hl >= HL_TREND_MIN:
+                TrendScore += 1
+        elif not np.isnan(hl) and hl >= HL_TREND_MIN:
+            TrendScore += 1
+
+        # Bollinger compression/expansion with ADX gating
+        if (not np.isnan(bb_bw)) and (not np.isnan(bb_bw_ma)) and bb_bw_ma != 0:
+            ratio = bb_bw / bb_bw_ma
+            if ratio <= BB_COMPRESS_RATIO and (np.isnan(adx) or adx <= ADX_MR_MAX):
+                MRScore += 1
+            elif ratio >= BB_EXPAND_RATIO and (np.isnan(adx) or adx >= ADX_TREND_MIN):
+                TrendScore += 1
+
+        prev_mode = prev_mode or "TREND"
+        if TrendScore >= 1 and MRScore == 0:
+            return "TREND"
+        if MRScore >= 2 and TrendScore == 0:
+            return "MR"
+        return prev_mode
 
     position_mode: Optional[str] = None
 
@@ -577,7 +899,6 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                 # Initial stop from entry ATR (kept from entry)
                 if direction == "LONG":
                     base_stop = entry_price - ATR_STOP_MULT * atr_at_entry
-                    MIN_STOP_STEP_ATR = 0.25
                     if base_stop > stop_price + MIN_STOP_STEP_ATR * atr_at_entry:
                         stop_price = base_stop
                 else:
@@ -585,14 +906,16 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                     if base_stop < stop_price - MIN_STOP_STEP_ATR * atr_at_entry:
                         stop_price = base_stop
 
-                # Breakeven once price moves in favor by BE_TRIGGER_ATR
-                if move_fav >= BE_TRIGGER_ATR * atr_at_entry:
+                # Breakeven once price moves in favor by threshold (MR may use earlier trigger)
+                BE_TRIG_LOCAL = (MR_BE_TRIGGER_ATR if position_mode == "MR" else BE_TRIGGER_ATR)
+                BE_OFF_LOCAL = (MR_BE_OFFSET_ATR if position_mode == "MR" else BE_OFFSET_ATR)
+                if move_fav >= BE_TRIG_LOCAL * atr_at_entry:
                     if direction == "LONG":
-                        target = entry_price + BE_OFFSET_ATR * atr_at_entry
+                        target = entry_price + BE_OFF_LOCAL * atr_at_entry
                         if target > stop_price + MIN_STOP_STEP_ATR * atr_at_entry:
                             stop_price = target
                     else:
-                        target = entry_price - BE_OFFSET_ATR * atr_at_entry
+                        target = entry_price - BE_OFF_LOCAL * atr_at_entry
                         if target < stop_price - MIN_STOP_STEP_ATR * atr_at_entry:
                             stop_price = target
 
@@ -632,6 +955,19 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                         target = entry_price - 0.5 * atr_at_entry
                         if target < stop_price - MIN_STOP_STEP_ATR * atr_at_entry:
                             stop_price = target
+
+                # Winner-protection: if MFE reaches SAFE_MFE_POINTS (points),
+                # enforce a minimum stop at breakeven + small offset so a big winner
+                # cannot become a full loser.
+                if SAFE_MFE_POINTS and entry_price is not None and mfe_price is not None:
+                    if direction == "LONG" and (mfe_price - entry_price) >= SAFE_MFE_POINTS:
+                        min_stop = entry_price + SAFE_BE_OFFSET_POINTS
+                        if (stop_price is None) or (min_stop > stop_price):
+                            stop_price = min_stop
+                    elif direction == "SHORT" and (entry_price - mfe_price) >= SAFE_MFE_POINTS:
+                        min_stop = entry_price - SAFE_BE_OFFSET_POINTS
+                        if (stop_price is None) or (min_stop < stop_price):
+                            stop_price = min_stop
 
             # Pyramiding: add on favorable moves at ATR steps
             if PYRAMID_ENABLED and atr_at_entry and not np.isnan(atr_at_entry) and qty < MAX_CONTRACTS:
@@ -710,6 +1046,8 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                         atr_at_entry=atr_at_entry,
                         stop_points_entry=stop_points_entry,
                         mode=position_mode,
+                        strategy=position_strategy if 'position_strategy' in locals() else position_mode,
+                        entry_reason=position_entry_reason if 'position_entry_reason' in locals() else None,
                         is_full_exit=False,
                         mfe_points=(max(0.0, float(mfe_price - entry_price)) if entry_price is not None and mfe_price is not None and direction == "LONG" else (max(0.0, float(entry_price - mfe_price)) if entry_price is not None and mfe_price is not None else None)),
                         mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
@@ -738,6 +1076,8 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                         atr_at_entry=atr_at_entry,
                         stop_points_entry=stop_points_entry,
                         mode=position_mode,
+                        strategy=position_strategy if 'position_strategy' in locals() else position_mode,
+                        entry_reason=position_entry_reason if 'position_entry_reason' in locals() else None,
                         is_full_exit=False,
                         mfe_points=(max(0.0, float(mfe_price - entry_price)) if entry_price is not None and mfe_price is not None and direction == "LONG" else (max(0.0, float(entry_price - mfe_price)) if entry_price is not None and mfe_price is not None else None)),
                         mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
@@ -746,7 +1086,19 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                     position = qty if direction == "LONG" else -qty
                     pos_trend_partial2_done = True
 
-            # MR exits disabled (no MR positions created)
+            # MR exits: exit on Z reversion toward zero; tighter ATR stop applied at entry
+            if not exited and position_mode == "MR":
+                z_here = get_mr_z(row)
+                if z_here is not None and not np.isnan(z_here):
+                    # Close near zero: |z| <= MR_Z_TP_ZONE
+                    if direction == "LONG" and z_here >= -MR_Z_TP_ZONE:
+                        exit_reason = "MR_Z_REVERSION"
+                        exit_price = close
+                        exited = True
+                    elif direction == "SHORT" and z_here <= MR_Z_TP_ZONE:
+                        exit_reason = "MR_Z_REVERSION"
+                        exit_price = close
+                        exited = True
 
             # 3) Exhaustion: prefer runner (partial) and require ADX rollover + profit
             EXH_MIN_PROFIT_ATR = 0.5
@@ -929,6 +1281,9 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                         initial_stop=init_stop,
                         atr_at_entry=atr_at_entry,
                         stop_points_entry=stop_points_entry,
+                        mode=position_mode,
+                        strategy=position_strategy if 'position_strategy' in locals() else position_mode,
+                        entry_reason=position_entry_reason if 'position_entry_reason' in locals() else None,
                         is_full_exit=False,
                         mfe_points=(max(0.0, float(mfe_price - entry_price)) if entry_price is not None and mfe_price is not None and direction == "LONG" else (max(0.0, float(entry_price - mfe_price)) if entry_price is not None and mfe_price is not None else None)),
                         mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
@@ -956,6 +1311,9 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                         initial_stop=init_stop,
                         atr_at_entry=atr_at_entry,
                         stop_points_entry=stop_points_entry,
+                        mode=position_mode,
+                        strategy=position_strategy if 'position_strategy' in locals() else position_mode,
+                        entry_reason=position_entry_reason if 'position_entry_reason' in locals() else None,
                         is_full_exit=False,
                         mfe_points=(max(0.0, float(mfe_price - entry_price)) if entry_price is not None and mfe_price is not None and direction == "LONG" else (max(0.0, float(entry_price - mfe_price)) if entry_price is not None and mfe_price is not None else None)),
                         mfe_price_at_exit=float(mfe_price) if mfe_price is not None else None,
@@ -994,6 +1352,9 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                         qty=qty,
                         pnl=pnl,
                         reason="MAX_DD_LIQUIDATION",
+                        mode=position_mode,
+                        strategy=position_strategy if 'position_strategy' in locals() else position_mode,
+                        entry_reason=position_entry_reason if 'position_entry_reason' in locals() else None,
                         initial_stop=init_stop,
                         atr_at_entry=atr_at_entry,
                         stop_points_entry=stop_points_entry,
@@ -1022,52 +1383,99 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
 
             if atr is None or np.isnan(atr) or atr <= 0:
                 continue
-            # ATR/$ATR entry bands disabled for backtest when ATR_FILTER_ENABLED is False
-            if ATR_FILTER_ENABLED:
-                ATR_ENTRY_MIN = 6.0
-                ATR_ENTRY_MAX = 20.0
-                hh = ts.hour
-                mm = ts.minute
-                sym = (base_symbol or BASE_SYMBOL or "MNQ").upper()
-                pv_here = point_value_for(sym)
-                datr = atr * pv_here
-                if sym in DATR_BAND_MAP:
-                    lo, hi = DATR_BAND_MAP[sym]
-                    if not (lo <= datr <= hi):
-                        continue
-                elif sym in ATR_BAND_MAP:
-                    lo, hi = ATR_BAND_MAP[sym]
-                    if not (lo <= atr <= hi):
-                        continue
-                elif sym in DEFAULT_ATR_BANDS:
-                    lo, hi = DEFAULT_ATR_BANDS[sym]
-                    if not (lo <= atr <= hi):
-                        continue
-                else:
-                    atr_min_use = ATR_ENTRY_MIN
-                    if (hh > 8 or (hh == 8 and mm >= 30)) and (hh < 11 or (hh == 11 and mm == 0)):
-                        atr_min_use = max(atr_min_use, 8.0)
-                    if not (atr_min_use <= atr <= ATR_ENTRY_MAX):
-                        continue
-            if np.isnan(donch_high) or np.isnan(donch_low) or np.isnan(ema_1h):
+            if np.isnan(ema_1h):
                 continue
 
-            mode = decide_mode(row)
+            prev_mode_here = last_mode or "TREND"
+            mode = decide_trading_mode(row, prev_mode=prev_mode_here)
+            if mode != prev_mode_here:
+                try:
+                    ratio = float(row.get("bb_bw_5") or np.nan) / float(row.get("bb_bw_ma_5") or np.nan)
+                except Exception:
+                    ratio = np.nan
+                try:
+                    print(f"[{base_symbol}] mode change: {prev_mode_here} -> {mode}, half_life={float(row.get('half_life') or np.nan):.1f}, adx_15m={float(row.get('adx_15m') or np.nan):.1f}, bb_ratio={(ratio if not np.isnan(ratio) else float('nan')):.2f}")
+                except Exception:
+                    pass
+            last_mode = mode
+            # optional: attach for analysis
+            try:
+                df.loc[ts, 'mode'] = mode  # type: ignore[index]
+            except Exception:
+                pass
+            # regime counts
+            if mode == "TREND":
+                stats["trend_bars"] += 1
+            elif mode == "MR":
+                stats["mr_bars"] += 1
+            # ATR band: TREND uses per-symbol/global; MR for MNQ uses MR ATR band
+            sym = (base_symbol or BASE_SYMBOL or "MNQ").upper()
+            if mode == "MR" and MR_ENABLE and is_mnq_symbol(sym):
+                if not atr_in_mr_band(float(atr)):
+                    stats["skipped_atr"] += 1
+                    continue
+            else:
+                if not atr_in_band_for_symbol(sym, float(atr)):
+                    stats["skipped_atr"] += 1
+                    continue
+
             long_signal = False
             short_signal = False
 
             if mode == "TREND":
+                # Overextension advisory only (no hard block)
+                # If you want to hard-block extreme entries again, re-enable the continue.
+                # if is_overextended(row):
+                #     stats["skipped_overext"] += 1
+                #     continue
                 # Early trend breakout in direction of hourly trend
-                if regime == "UP" and close > donch_high:
-                    long_signal = True
-                elif regime == "DOWN" and close < donch_low:
-                    short_signal = True
-            # MR entries disabled
+                tsz = tick_size_for(sym)
+                if regime == "UP" and (not np.isnan(donch_high)) and close > (donch_high + tsz):
+                    if micro_pullback_ok(df, ts, "LONG"):
+                        long_signal = True
+                        entry_reason_tag = "BREAKOUT"
+                        entry_strategy_tag = "TREND"
+                    else:
+                        stats["skipped_pullback"] += 1
+                elif regime == "DOWN" and (not np.isnan(donch_low)) and close < (donch_low - tsz):
+                    if micro_pullback_ok(df, ts, "SHORT"):
+                        short_signal = True
+                        entry_reason_tag = "BREAKOUT"
+                        entry_strategy_tag = "TREND"
+                    else:
+                        stats["skipped_pullback"] += 1
+                else:
+                    stats["skipped_no_breakout"] += 1
+            elif mode == "MR" and MR_ENABLE and is_mnq_symbol(sym):
+                # Mean-reversion Z-score entries around EMA
+                z_val = get_mr_z(row)
+                if z_val is not None and not np.isnan(z_val):
+                    if abs(z_val) >= MR_Z_ENTRY and abs(z_val) <= MR_Z_MAX_EXTREME:
+                        if z_val <= -MR_Z_ENTRY:
+                            long_signal = True
+                            entry_reason_tag = "MR_Z_REVERSION"
+                            entry_strategy_tag = "MR"
+                        elif z_val >= MR_Z_ENTRY:
+                            short_signal = True
+                            entry_reason_tag = "MR_Z_REVERSION"
+                            entry_strategy_tag = "MR"
+                    else:
+                        stats["skipped_mr_z"] += 1
+                else:
+                    stats["skipped_mr_z"] += 1
 
             if long_signal:
                 stats["long_signal"] += 1
             if short_signal:
                 stats["short_signal"] += 1
+
+            # Directional cooldown per entry
+            if long_signal and (i - last_entry_i_long) < COOLDOWN_BARS:
+                stats["skipped_cooldown"] = stats.get("skipped_cooldown", 0) + 1
+                long_signal = False
+            if short_signal and (i - last_entry_i_short) < COOLDOWN_BARS:
+                stats["skipped_cooldown"] = stats.get("skipped_cooldown", 0) + 1
+                short_signal = False
 
             if long_signal or short_signal:
                 direction = "LONG" if long_signal else "SHORT"
@@ -1079,8 +1487,11 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                     continue
 
                 # Position sizing (risk-based only)
-                # ATR-based stop distance: 2x ATR
-                stop_points = 2.0 * atr
+                # ATR-based stop distance: tighter for MR and for TREND reduce to 1.5x ATR
+                if mode == "MR" and MR_ENABLE and is_mnq_symbol(sym):
+                    stop_points = max(0.25, MR_ATR_STOP_MULT * atr)
+                else:
+                    stop_points = 1.0 * atr
                 if stop_points <= 0:
                     continue
 
@@ -1112,6 +1523,12 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                 mfe_price = entry_price
                 total_positions += 1
                 position_mode = mode
+                try:
+                    position_strategy = entry_strategy_tag if ('entry_strategy_tag' in locals()) else ("TREND" if position_mode == "TREND" else "MR")
+                    position_entry_reason = entry_reason_tag if ('entry_reason_tag' in locals()) else None
+                except Exception:
+                    position_strategy = ("TREND" if position_mode == "TREND" else "MR")
+                    position_entry_reason = None
                 realized_at_entry = realized_pnl
                 pos_reached18 = False
                 pos_reached30 = False
@@ -1120,19 +1537,31 @@ def backtest(df: pd.DataFrame, base_symbol: Optional[str] = None):
                 entry_qty_local = qty
                 max_qty_local = qty
                 pyr_count = 0
+                # update entry cooldown indices
+                if direction == "LONG":
+                    last_entry_i_long = i
+                else:
+                    last_entry_i_short = i
 
         # record equity
         equity_curve.append(STARTING_CAPITAL + realized_pnl)
         timestamps.append(ts)
 
-    if not trades:
-        print("No entries fired; debug counts:")
-        for k in [
-            "bars",
-            "long_signal",
-            "short_signal",
-        ]:
-            print(f"  {k}: {stats.get(k, 0)}")
+    # Print diagnostics including skip reasons
+    print("Debug counts:")
+    for k in [
+        "bars",
+        "trend_bars",
+        "mr_bars",
+        "long_signal",
+        "short_signal",
+        "skipped_atr",
+        "skipped_overext",
+        "skipped_pullback",
+        "skipped_no_breakout",
+        "skipped_mr_z",
+    ]:
+        print(f"  {k}: {stats.get(k, 0)}")
 
     # Print diagnostics for % of positions reaching trailing tiers and avg win/loss
     if total_positions > 0:
@@ -1179,6 +1608,21 @@ def summarize_trades(trades: List[Trade]):
     print(f"Gross loss: {gross_loss:.2f}")
     print(f"Net PnL: {net:.2f}")
 
+    # Per-day trade counts and PnL (by entry date)
+    try:
+        dates = pd.to_datetime(df_trades["entry_time"]).dt.date
+        df_trades["_entry_date"] = dates
+        daily = (
+            df_trades.groupby("_entry_date")["pnl"].agg(["count", "sum"]).rename(
+                columns={"count": "trades", "sum": "pnl"}
+            )
+        )
+        print("\n===== Trades per day =====")
+        for d, row_day in daily.iterrows():
+            print(f"{d}: {int(row_day['trades'])} trades, PnL={row_day['pnl']:.2f}")
+    except Exception as e:
+        print(f"Daily breakdown error: {e}")
+
     # Losing trades that were in profit (MFE>0)
     try:
         losers = df_trades[(df_trades["pnl"] < 0) & (df_trades["is_full_exit"] == True)]
@@ -1193,6 +1637,29 @@ def summarize_trades(trades: List[Trade]):
             )
     except Exception as e:
         print(f"Analysis error (MFE on losers): {e}")
+
+    # Daily breakdown (full exits only)
+    try:
+        df_full = df_trades[df_trades.get("is_full_exit", True) == True].copy()
+        if not df_full.empty and "exit_time" in df_full.columns:
+            # normalize date
+            et = pd.to_datetime(df_full["exit_time"], errors="coerce")
+            try:
+                et = et.dt.tz_convert("US/Central")
+            except Exception:
+                pass
+            df_full["date"] = et.dt.date
+            daily = df_full.groupby("date")["pnl"].agg(["count", "sum"]).reset_index()
+            print("\nDaily breakdown (full exits):")
+            for _, r in daily.iterrows():
+                print(f"  {r['date']}: trades={int(r['count'])} pnl=${float(r['sum']):.2f}")
+            # save for analysis
+            try:
+                daily.to_csv("daily_breakdown.csv", index=False)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Daily breakdown error: {e}")
 
     print("\nSample trades:")
     print(df_trades.head())
@@ -1218,6 +1685,197 @@ def trades_to_df(trades: List[Trade]) -> pd.DataFrame:
     return pd.DataFrame([t.__dict__ for t in trades])
 
 
+def _last_hours_window(df: pd.DataFrame, hours: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    cutoff = df.index.max() - pd.Timedelta(hours=int(hours))
+    return df[df.index >= cutoff]
+
+
+def _collect_entry_events(trades: List[Trade], start_ts: pd.Timestamp, end_ts: pd.Timestamp):
+    # Deduplicate entries by (entry_time, direction, entry_price)
+    seen = set()
+    events = []
+    for t in trades:
+        et = pd.Timestamp(t.entry_time)
+        if et >= start_ts and et <= end_ts:
+            key = (et.value, t.direction, float(t.entry_price))
+            if key not in seen:
+                seen.add(key)
+                events.append({
+                    "time": et,
+                    "price": float(t.entry_price),
+                    "direction": t.direction,
+                })
+    # sort by time
+    events.sort(key=lambda x: x["time"])
+    return events
+
+
+def plot_price_with_executions(df: pd.DataFrame, trades: List[Trade], hours: int = 24, symbol: str = "MNQ"):
+    if df.empty:
+        print("No price data to plot.")
+        return
+    win = _last_hours_window(df, hours)
+    if win.empty:
+        print(f"No data within last {hours} hours to plot.")
+        return
+
+    start_ts = win.index.min()
+    end_ts = win.index.max()
+    # Build entry events and collect exits (partials and full)
+    entries = _collect_entry_events(trades, start_ts, end_ts)
+    exits = []
+    for t in trades:
+        xt = pd.Timestamp(t.exit_time)
+        if xt >= start_ts and xt <= end_ts:
+            exits.append({
+                "time": xt,
+                "price": float(t.exit_price),
+                "direction": t.direction,
+                "is_full": bool(t.is_full_exit),
+                "reason": t.reason,
+                "qty": int(t.qty) if t.qty is not None else None,
+                "pnl": float(getattr(t, "pnl", np.nan)) if getattr(t, "pnl", None) is not None else np.nan,
+            })
+
+    # Compute 24h PnL and counts
+    try:
+        pnl_24 = float(sum([getattr(t, "pnl", 0.0) for t in trades if pd.Timestamp(t.exit_time) >= start_ts and pd.Timestamp(t.exit_time) <= end_ts]))
+        n_full = int(sum([1 for t in trades if pd.Timestamp(t.exit_time) >= start_ts and pd.Timestamp(t.exit_time) <= end_ts and bool(t.is_full_exit)]))
+        n_part = int(sum([1 for t in trades if pd.Timestamp(t.exit_time) >= start_ts and pd.Timestamp(t.exit_time) <= end_ts and not bool(t.is_full_exit)]))
+    except Exception:
+        pnl_24, n_full, n_part = 0.0, 0, 0
+
+    # Estimate entry sizes per entry_time using max of entry_qty or qty
+    entry_size_map = {}
+    for t in trades:
+        et = pd.Timestamp(t.entry_time)
+        if et < start_ts or et > end_ts:
+            continue
+        size_hint = None
+        if getattr(t, "entry_qty", None) is not None and not pd.isna(t.entry_qty):
+            try:
+                size_hint = int(t.entry_qty)
+            except Exception:
+                pass
+        if size_hint is None:
+            try:
+                size_hint = max(int(getattr(t, "max_qty", 0) or 0), int(getattr(t, "qty", 0) or 0))
+            except Exception:
+                size_hint = int(getattr(t, "qty", 0) or 0)
+        prev = entry_size_map.get(et)
+        if prev is None or (isinstance(size_hint, int) and size_hint > prev):
+            entry_size_map[et] = size_hint
+
+    import matplotlib.dates as mdates
+    from matplotlib.patches import Rectangle
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # Candlestick rendering
+    x = mdates.date2num(win.index.to_pydatetime())
+    o = win["Open"].values
+    h = win["High"].values
+    l = win["Low"].values
+    c = win["Close"].values
+    if len(x) > 1:
+        width = (x[1] - x[0]) * 0.6
+    else:
+        width = 0.0005
+    for xi, oi, hi, li, ci in zip(x, o, h, l, c):
+        up = ci >= oi
+        color = "#2ca02c" if up else "#d62728"
+        ax.vlines(xi, li, hi, color=color, linewidth=0.6, alpha=0.9)
+        body_y = min(oi, ci)
+        body_h = abs(ci - oi)
+        if body_h < 1e-6:
+            ax.hlines(ci, xi - width/2, xi + width/2, color=color, linewidth=1.2, alpha=0.9)
+        else:
+            rect = Rectangle((xi - width/2, body_y), width, body_h, facecolor=color, edgecolor=color, alpha=0.8)
+            ax.add_patch(rect)
+    ax.set_xlim(win.index[0], win.index[-1])
+    ax.xaxis_date()
+
+    # Entries
+    for ev in entries:
+        if ev["direction"] == "LONG":
+            ax.scatter(ev["time"], ev["price"], marker="^", s=64, color="#2ca02c", label=None, zorder=5)
+        else:
+            ax.scatter(ev["time"], ev["price"], marker="v", s=64, color="#d62728", label=None, zorder=5)
+        # Annotate with direction and size hint
+        size_hint = entry_size_map.get(pd.Timestamp(ev["time"]))
+        if size_hint and size_hint > 0:
+            label = ("L" if ev["direction"] == "LONG" else "S") + f" x{size_hint}"
+            ax.annotate(label, xy=(ev["time"], ev["price"]), xytext=(0, -12 if ev["direction"] == "SHORT" else 12), textcoords='offset points', color="#333333", fontsize=7, ha='center', va='bottom' if ev["direction"] == "LONG" else 'top', bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.7))
+
+    # Exits and partials (annotate profitability)
+    for ev in exits:
+        pnl = ev.get("pnl")
+        pnl_color = "#2ca02c" if (pnl is not None and not pd.isna(pnl) and pnl > 0) else ("#d62728" if (pnl is not None and not pd.isna(pnl) and pnl < 0) else "#7f7f7f")
+        if not ev["is_full"]:
+            ax.scatter(ev["time"], ev["price"], marker="o", s=38, facecolors="none", edgecolors=pnl_color, label=None, zorder=6)
+            # annotate partial qty and pnl
+            try:
+                parts = []
+                qty = ev.get("qty")
+                if qty:
+                    parts.append(f"x{qty}")
+                if pnl is not None and not pd.isna(pnl):
+                    parts.append(("+$" if pnl >= 0 else "-$") + f"{abs(pnl):.0f}")
+                if parts:
+                    ax.annotate("part " + " ".join(parts), xy=(ev["time"], ev["price"]), xytext=(6, 6), textcoords='offset points', fontsize=7, color=pnl_color, bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.6))
+            except Exception:
+                pass
+        else:
+            ax.scatter(ev["time"], ev["price"], marker="x", s=52, color=pnl_color, label=None, zorder=6)
+            # annotate reason, qty, and pnl
+            try:
+                parts = []
+                reason = ev.get("reason")
+                if reason:
+                    parts.append(str(reason))
+                qty = ev.get("qty")
+                if qty:
+                    parts.append(f"x{qty}")
+                if pnl is not None and not pd.isna(pnl):
+                    parts.append(("+$" if pnl >= 0 else "-$") + f"{abs(pnl):.0f}")
+                if parts:
+                    ax.annotate(" ".join(parts), xy=(ev["time"], ev["price"]), xytext=(6, -10), textcoords='offset points', fontsize=7, color=pnl_color, bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.6))
+            except Exception:
+                pass
+
+    ax.set_title(f"{symbol} 1m Candles with Executions (Last {hours}h)")
+    ax.set_xlabel("Time (US/Central)")
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.25)
+    # Left-top info box with last-N-hours PnL
+    try:
+        info = f"PnL {hours}h: ${pnl_24:.2f}\nFull: {n_full}  Partials: {n_part}"
+        ax.text(0.01, 0.99, info, transform=ax.transAxes, va='top', ha='left', fontsize=8, bbox=dict(boxstyle='round', fc='white', ec='#999999', alpha=0.8))
+    except Exception:
+        pass
+    # Build a simple legend proxy
+    import matplotlib.lines as mlines
+    long_entry = mlines.Line2D([], [], color="#2ca02c", marker='^', linestyle='None', markersize=8, label='Entry LONG')
+    short_entry = mlines.Line2D([], [], color="#d62728", marker='v', linestyle='None', markersize=8, label='Entry SHORT')
+    partial = mlines.Line2D([], [], color="#ff7f0e", marker='o', fillstyle='none', linestyle='None', markersize=6, label='Partial Exit')
+    full_stop = mlines.Line2D([], [], color="#d62728", marker='x', linestyle='None', markersize=7, label='Full Exit (STOP)')
+    full_other = mlines.Line2D([], [], color="#1f77b4", marker='x', linestyle='None', markersize=7, label='Full Exit (Other)')
+    ax.legend(handles=[long_entry, short_entry, partial, full_stop, full_other], loc='best')
+    plt.tight_layout()
+    if os.environ.get("BACKTEST_SAVE_PLOTS", "").strip():
+        fname = f"{symbol.lower()}_executions_last{hours}h.png"
+        try:
+            plt.savefig(fname, dpi=150)
+            print(f"Saved execution plot to {fname}")
+        except Exception as e:
+            print(f"Could not save execution plot: {e}")
+        finally:
+            plt.close(fig)
+    else:
+        plt.show()
+
+
 def plot_equity(equity: pd.Series):
     plt.figure(figsize=(10, 5))
     plt.plot(equity.index, equity.values)
@@ -1226,7 +1884,16 @@ def plot_equity(equity: pd.Series):
     plt.ylabel("Equity ($)")
     plt.grid(True)
     plt.tight_layout()
-    plt.show()
+    if os.environ.get("BACKTEST_SAVE_PLOTS", "").strip():
+        try:
+            plt.savefig("equity_curve.png", dpi=150)
+            print("Saved equity curve to equity_curve.png")
+        except Exception as e:
+            print(f"Could not save equity curve: {e}")
+        finally:
+            plt.close()
+    else:
+        plt.show()
 
 
 def plot_daily_pnl(equity: pd.Series, target_per_day: float = 1000.0):
@@ -1243,7 +1910,16 @@ def plot_daily_pnl(equity: pd.Series, target_per_day: float = 1000.0):
     plt.ylabel('$')
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    if os.environ.get("BACKTEST_SAVE_PLOTS", "").strip():
+        try:
+            plt.savefig("daily_pnl.png", dpi=150)
+            print("Saved daily PnL plot to daily_pnl.png")
+        except Exception as e:
+            print(f"Could not save daily PnL plot: {e}")
+        finally:
+            plt.close()
+    else:
+        plt.show()
 
 
 def main():
@@ -1271,6 +1947,52 @@ def main():
             # Per-ticker summary
             print(f"\n=== Summary for {base_symbol} ===")
             summarize_trades(trades)
+            # Per-ticker last-N-hours CSV and execution plot
+            try:
+                hours_env = os.environ.get("BACKTEST_WINDOW_HOURS", "24")
+                try:
+                    win_hours = int(hours_env)
+                except Exception:
+                    win_hours = 24
+
+                import pandas as _pd  # local alias to avoid scope issues
+                start_ts = df.index.max() - _pd.Timedelta(hours=win_hours)
+                df_tr_local = trades_to_df(trades)
+                if not df_tr_local.empty:
+                    mask = (_pd.to_datetime(df_tr_local["exit_time"]) >= start_ts)
+                    df_24 = df_tr_local.loc[mask].copy()
+                    out_name = f"{base_symbol.lower()}_trades_last{win_hours}h.csv"
+                    try:
+                        df_24.to_csv(out_name, index=False)
+                        net_24 = float(_pd.to_numeric(df_24["pnl"], errors="coerce").sum())
+                        n_full_24 = int((df_24.get("is_full_exit", True) == True).sum()) if "is_full_exit" in df_24.columns else int(len(df_24))
+                        n_part_24 = int((df_24.get("is_full_exit", False) == False).sum()) if "is_full_exit" in df_24.columns else 0
+                        print(f"Saved last {win_hours}h trades to {out_name} | Net PnL: ${net_24:.2f} | Full: {n_full_24} Partials: {n_part_24}")
+                    except Exception as e:
+                        print(f"Could not save {out_name}: {e}")
+
+                plot_price_with_executions(df, trades, hours=win_hours, symbol=base_symbol)
+            except Exception as e:
+                print(f"Per-ticker 24h outputs failed for {base_symbol}: {e}")
+
+            # Also run a dedicated 1-day backtest (1m/1d) per symbol
+            try:
+                print(f"Running 1d backtest for {base_symbol} (1m/1d)...")
+                df_1d = load_mnq_data(ticker=tkr, period="1d")
+                if not df_1d.empty:
+                    trades_1d, equity_1d = backtest(df_1d, base_symbol=base_symbol)
+                    # Save 1d trades CSV per symbol
+                    try:
+                        df_1d_tr = trades_to_df(trades_1d)
+                        out1d = f"{base_symbol.lower()}_trades_1d.csv"
+                        df_1d_tr.to_csv(out1d, index=False)
+                        print(f"Saved 1d trades to {out1d}")
+                    except Exception as e:
+                        print(f"Could not save 1d trades for {base_symbol}: {e}")
+                else:
+                    print(f"No data for {base_symbol} 1d run.")
+            except Exception as e:
+                print(f"1d backtest failed for {base_symbol}: {e}")
 
             # Collect for aggregate CSV
             try:
@@ -1338,6 +2060,8 @@ def main():
         sym0, eq0 = all_equities[0]
         plot_equity(eq0)
         plot_daily_pnl(eq0, target_per_day=1000.0)
+
+    # Per-ticker 24h artifacts handled inside loop for each symbol.
 
 
 if __name__ == "__main__":
